@@ -19,9 +19,13 @@ type ReplicaManager struct {
 	leaderState   map[string]*LeaderState
 	followerState map[string]*FollowerState
 
+	// Network client for inter-broker communication
+	brokerClient *BrokerClient
+
 	// Configuration
 	replicationTimeout time.Duration
 	heartbeatInterval  time.Duration
+	fetchMaxBytes      int64
 }
 
 // Replica represents a replica of a partition
@@ -67,8 +71,10 @@ func NewReplicaManager(broker *Broker) *ReplicaManager {
 		replicas:           make(map[string]*Replica),
 		leaderState:        make(map[string]*LeaderState),
 		followerState:      make(map[string]*FollowerState),
+		brokerClient:       NewBrokerClient(),
 		replicationTimeout: 30 * time.Second,
 		heartbeatInterval:  1 * time.Second,
+		fetchMaxBytes:      1024 * 1024, // 1MB
 	}
 }
 
@@ -80,12 +86,18 @@ func (rm *ReplicaManager) Start() error {
 	// Start ISR monitoring
 	go rm.monitorISR()
 
+	// Start follower fetch loop
+	go rm.followerFetchLoop()
+
 	return nil
 }
 
 // Stop stops the replica manager
 func (rm *ReplicaManager) Stop() error {
 	rm.cancel()
+	if rm.brokerClient != nil {
+		rm.brokerClient.Close()
+	}
 	return nil
 }
 
@@ -264,8 +276,7 @@ func (rm *ReplicaManager) sendHeartbeats() {
 
 // sendLeaderHeartbeat sends heartbeat from leader to followers
 func (rm *ReplicaManager) sendLeaderHeartbeat(replica *Replica) {
-	// TODO: Implement actual network communication with followers
-	// For now, just log the heartbeat
+	// Leader just updates local state - followers will fetch
 	key := fmt.Sprintf("%s-%d", replica.TopicName, replica.PartitionID)
 	if leaderState, exists := rm.leaderState[key]; exists {
 		leaderState.mu.Lock()
@@ -276,14 +287,34 @@ func (rm *ReplicaManager) sendLeaderHeartbeat(replica *Replica) {
 
 // sendFollowerHeartbeat sends heartbeat from follower to leader
 func (rm *ReplicaManager) sendFollowerHeartbeat(replica *Replica) {
-	// TODO: Implement actual network communication with leader
-	// For now, just log the heartbeat
 	key := fmt.Sprintf("%s-%d", replica.TopicName, replica.PartitionID)
-	if followerState, exists := rm.followerState[key]; exists {
-		followerState.mu.Lock()
-		followerState.lastFetch = time.Now()
-		followerState.mu.Unlock()
+	followerState, exists := rm.followerState[key]
+	if !exists {
+		return
 	}
+
+	followerState.mu.RLock()
+	leaderAddr := followerState.leaderAddr
+	leo := followerState.leo
+	followerState.mu.RUnlock()
+
+	// Send heartbeat to leader
+	_, err := rm.brokerClient.SendHeartbeatToLeader(
+		leaderAddr,
+		rm.broker.nodeID,
+		replica.TopicName,
+		replica.PartitionID,
+		leo,
+	)
+
+	if err != nil {
+		fmt.Printf("Failed to send heartbeat to leader %s: %v\n", leaderAddr, err)
+		return
+	}
+
+	followerState.mu.Lock()
+	followerState.lastFetch = time.Now()
+	followerState.mu.Unlock()
 }
 
 // monitorISR monitors and updates the In-Sync Replicas
@@ -372,4 +403,100 @@ func (rm *ReplicaManager) GetReplicationFactor(topicName string) int32 {
 	}
 
 	return count
+}
+
+// followerFetchLoop continuously fetches data from leaders for follower partitions
+func (rm *ReplicaManager) followerFetchLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond) // Fetch every 100ms
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rm.ctx.Done():
+			return
+		case <-ticker.C:
+			rm.fetchFromLeaders()
+		}
+	}
+}
+
+// fetchFromLeaders fetches data from all leaders this broker is following
+func (rm *ReplicaManager) fetchFromLeaders() {
+	rm.mu.RLock()
+	followerStates := make(map[string]*FollowerState)
+	replicas := make(map[string]*Replica)
+	for key, state := range rm.followerState {
+		followerStates[key] = state
+		replicas[key] = rm.replicas[key]
+	}
+	rm.mu.RUnlock()
+
+	for key, followerState := range followerStates {
+		replica := replicas[key]
+		if replica == nil {
+			continue
+		}
+
+		rm.fetchFromLeader(replica, followerState)
+	}
+}
+
+// fetchFromLeader fetches data from a leader for a specific partition
+func (rm *ReplicaManager) fetchFromLeader(replica *Replica, followerState *FollowerState) {
+	followerState.mu.RLock()
+	leaderAddr := followerState.leaderAddr
+	fetchOffset := followerState.leo
+	followerState.mu.RUnlock()
+
+	// Fetch from leader
+	resp, err := rm.brokerClient.FetchFromLeader(
+		leaderAddr,
+		replica.TopicName,
+		replica.PartitionID,
+		fetchOffset,
+		rm.fetchMaxBytes,
+		rm.broker.nodeID,
+	)
+
+	if err != nil {
+		fmt.Printf("Failed to fetch from leader %s for %s-%d: %v\n",
+			leaderAddr, replica.TopicName, replica.PartitionID, err)
+		return
+	}
+
+	if resp.Error != "" {
+		fmt.Printf("Leader returned error for %s-%d: %s\n",
+			replica.TopicName, replica.PartitionID, resp.Error)
+		return
+	}
+
+	// Append records to local log
+	if len(resp.Records) > 0 {
+		log := rm.broker.GetLog(replica.TopicName, replica.PartitionID)
+		if log == nil {
+			fmt.Printf("Log not found for %s-%d\n", replica.TopicName, replica.PartitionID)
+			return
+		}
+
+		for _, record := range resp.Records {
+			_, err := log.Append(record.Value)
+			if err != nil {
+				fmt.Printf("Failed to append record to log %s-%d: %v\n",
+					replica.TopicName, replica.PartitionID, err)
+				return
+			}
+		}
+
+		// Update follower state
+		followerState.mu.Lock()
+		followerState.leo = resp.LogEndOffset
+		followerState.hwMark = resp.HighWatermark
+		followerState.lastFetch = time.Now()
+		followerState.lastCaughtUp = time.Now()
+		followerState.mu.Unlock()
+
+		// Update replica state
+		replica.LastCaughtUp = time.Now()
+		replica.IsInSync = true
+	}
 }

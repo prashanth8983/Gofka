@@ -39,11 +39,14 @@ type Broker struct {
 	offsetManager            *OffsetManager
 
 	// Configuration
-	addr     string
-	logDir   string
-	raftAddr string
-	raftDir  string
-	nodeID   string
+	addr               string
+	logDir             string
+	raftAddr           string
+	raftDir            string
+	nodeID             string
+	minInsyncReplicas  int32
+	defaultAcks        int32
+	defaultTimeoutMs   int32
 }
 
 // NewBroker creates a new Broker instance.
@@ -51,14 +54,17 @@ func NewBroker(nodeID, addr, logDir, raftAddr, raftDir string) (*Broker, error) 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	b := &Broker{
-		ctx:      ctx,
-		cancel:   cancel,
-		logs:     make(map[string]*log.Log),
-		addr:     addr,
-		logDir:   logDir,
-		raftAddr: raftAddr,
-		raftDir:  raftDir,
-		nodeID:   nodeID,
+		ctx:               ctx,
+		cancel:            cancel,
+		logs:              make(map[string]*log.Log),
+		addr:              addr,
+		logDir:            logDir,
+		raftAddr:          raftAddr,
+		raftDir:           raftDir,
+		nodeID:            nodeID,
+		minInsyncReplicas: 1, // Default: at least 1 replica (leader) must ack
+		defaultAcks:       1, // Default: wait for leader ack only
+		defaultTimeoutMs:  5000, // Default: 5 second timeout
 	}
 
 	storage, err := storage.NewDiskStorage(logDir)
@@ -227,6 +233,11 @@ func (b *Broker) getOrCreateLog(topic string) (*log.Log, error) {
 
 // ProduceMessage handles message production through Raft consensus.
 func (b *Broker) ProduceMessage(topic string, message []byte) (int64, error) {
+	return b.ProduceMessageWithAcks(topic, message, b.defaultAcks, b.defaultTimeoutMs)
+}
+
+// ProduceMessageWithAcks handles message production with ack configuration
+func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, timeoutMs int32) (int64, error) {
 	// Auto-create topic and partition metadata if they don't exist
 	if _, exists := b.metadataStore.GetTopic(topic); !exists {
 		// Create topic with default settings
@@ -245,6 +256,12 @@ func (b *Broker) ProduceMessage(topic string, message []byte) (int64, error) {
 			Replicas:  []string{b.nodeID},
 		}
 		b.metadataStore.AddPartition(partition)
+	}
+
+	// Check if this broker is the leader for partition 0
+	partition, _ := b.metadataStore.GetPartition(topic, 0)
+	if partition != nil && partition.Leader != b.nodeID {
+		return 0, fmt.Errorf("not leader for partition %s-0", topic)
 	}
 
 	// Get the next offset for this topic from the replicated state
@@ -279,7 +296,27 @@ func (b *Broker) ProduceMessage(topic string, message []byte) (int64, error) {
 		return 0, fmt.Errorf("failed to append to local log: %w", err)
 	}
 
-	return offset, nil
+	// Handle acks configuration
+	switch acks {
+	case 0:
+		// No ack required - return immediately
+		return offset, nil
+	case 1:
+		// Leader ack only - already written locally, return
+		return offset, nil
+	case -1:
+		// All ISR acks required - check ISR count
+		isr := b.replicationManager.GetISR(topic, 0)
+		if int32(len(isr)) < b.minInsyncReplicas {
+			return 0, fmt.Errorf("not enough in-sync replicas: %d < %d", len(isr), b.minInsyncReplicas)
+		}
+		// TODO: Wait for all ISR to acknowledge
+		// For now, just return since we're using Raft which ensures replication
+		return offset, nil
+	default:
+		// Invalid acks value
+		return 0, fmt.Errorf("invalid acks value: %d", acks)
+	}
 }
 
 // ConsumeMessage handles message consumption from replicated state.
@@ -436,6 +473,16 @@ func (b *Broker) GetConsumerGroupCoordinator() *ConsumerGroupCoordinator {
 // GetReplicationManager returns the replication manager
 func (b *Broker) GetReplicationManager() *ReplicaManager {
 	return b.replicationManager
+}
+
+// GetLog returns a log for a specific topic and partition
+func (b *Broker) GetLog(topic string, partition int32) *log.Log {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	// For now, use topic as key (single partition support)
+	// TODO: Support multiple partitions
+	return b.logs[topic]
 }
 
 // Protocol adapter methods to avoid import cycles
