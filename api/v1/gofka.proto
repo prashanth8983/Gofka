@@ -1,0 +1,201 @@
+syntax = "proto3";
+
+package gofka.v1;
+
+option go_package = "github.com/user/gofka/api/v1;gofkav1";
+
+// Define your Gofka API services and messages here.
+
+// Example: ProduceRequest represents a request to produce messages.
+message ProduceRequest {
+  string topic = 1;
+  repeated bytes messages = 2;
+}
+
+// Example: ProduceResponse represents a response to a produce request.
+message ProduceResponse {
+  int32 partition = 1;
+  int64 offset = 2;
+}
+
+// ConsumeRequest represents a request to consume messages.
+message ConsumeRequest {
+  string topic = 1;
+  int32 partition = 2;
+  int64 offset = 3;
+}
+
+// ConsumeResponse represents a response to a consume request.
+message ConsumeResponse {
+  repeated bytes messages = 1;
+}
+
+// MetadataRequest represents a request for cluster metadata.
+message MetadataRequest {
+  repeated string topics = 1;
+}
+
+// BrokerMetadata represents metadata for a broker.
+message BrokerMetadata {
+  string id = 1;
+  string addr = 2;
+}
+
+// PartitionMetadata represents metadata for a partition.
+message PartitionMetadata {
+  string topic_name = 1;
+  int32 id = 2;
+  string leader = 3;
+  repeated string replicas = 4;
+}
+
+// TopicMetadata represents metadata for a topic.
+message TopicMetadata {
+  string name = 1;
+  int32 num_partitions = 2;
+  int32 replication_factor = 3;
+  repeated PartitionMetadata partitions = 4;
+}
+
+// MetadataResponse represents a response with cluster metadata.
+message MetadataResponse {
+  repeated BrokerMetadata brokers = 1;
+  repeated TopicMetadata topics = 2;
+}
+
+message CreateTopicRequest {
+  string topic_name = 1;
+  int32 num_partitions = 2;
+  int32 replication_factor = 3;
+}
+
+message CreateTopicResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Offset management messages
+message OffsetCommitRequest {
+  string group_id = 1;
+  string topic = 2;
+  int32 partition = 3;
+  int64 offset = 4;
+  string metadata = 5;
+}
+
+message OffsetCommitResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message OffsetFetchRequest {
+  string group_id = 1;
+  string topic = 2;
+  int32 partition = 3;
+}
+
+message OffsetFetchResponse {
+  int64 offset = 1;
+  string metadata = 2;
+  string error = 3;
+}
+
+// Consumer group messages
+message JoinGroupRequest {
+  string group_id = 1;
+  string member_id = 2;
+  string client_id = 3;
+  string client_host = 4;
+  int32 session_timeout = 5;
+  repeated string subscriptions = 6;
+}
+
+message JoinGroupResponse {
+  string group_id = 1;
+  int32 generation = 2;
+  string member_id = 3;
+  string leader_id = 4;
+  string error = 5;
+}
+
+message HeartbeatRequest {
+  string group_id = 1;
+  string member_id = 2;
+  int32 generation = 3;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message SyncGroupRequest {
+  string group_id = 1;
+  string member_id = 2;
+  int32 generation = 3;
+}
+
+message PartitionAssignmentData {
+  string member_id = 1;
+  repeated int32 partition_ids = 2;
+}
+
+message SyncGroupResponse {
+  repeated int32 assigned_partitions = 1;
+  int32 generation = 2;
+  string error = 3;
+}
+
+message LeaveGroupRequest {
+  string group_id = 1;
+  string member_id = 2;
+}
+
+message LeaveGroupResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message Request {
+  oneof value {
+    ProduceRequest produce_request = 1;
+    ConsumeRequest consume_request = 2;
+    MetadataRequest metadata_request = 3;
+    CreateTopicRequest create_topic_request = 4;
+    OffsetCommitRequest offset_commit_request = 5;
+    OffsetFetchRequest offset_fetch_request = 6;
+    JoinGroupRequest join_group_request = 7;
+    HeartbeatRequest heartbeat_request = 8;
+    SyncGroupRequest sync_group_request = 9;
+    LeaveGroupRequest leave_group_request = 10;
+  }
+}
+
+message Response {
+  oneof value {
+    ProduceResponse produce_response = 1;
+    ConsumeResponse consume_response = 2;
+    MetadataResponse metadata_response = 3;
+    CreateTopicResponse create_topic_response = 4;
+    OffsetCommitResponse offset_commit_response = 5;
+    OffsetFetchResponse offset_fetch_response = 6;
+    JoinGroupResponse join_group_response = 7;
+    HeartbeatResponse heartbeat_response = 8;
+    SyncGroupResponse sync_group_response = 9;
+    LeaveGroupResponse leave_group_response = 10;
+  }
+}
+
+
+service GofkaService {
+  rpc Produce(ProduceRequest) returns (ProduceResponse);
+  rpc Consume(ConsumeRequest) returns (ConsumeResponse);
+  rpc GetMetadata(MetadataRequest) returns (MetadataResponse);
+  rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
+  rpc OffsetCommit(OffsetCommitRequest) returns (OffsetCommitResponse);
+  rpc OffsetFetch(OffsetFetchRequest) returns (OffsetFetchResponse);
+  rpc JoinGroup(JoinGroupRequest) returns (JoinGroupResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc SyncGroup(SyncGroupRequest) returns (SyncGroupResponse);
+  rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+}
