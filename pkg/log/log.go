@@ -120,3 +120,76 @@ func (l *Log) Read(offset int64) ([]byte, error) {
 
 	return nil, fmt.Errorf("offset %d not found in any segment", offset)
 }
+
+// ReadBatch reads a batch of messages starting from the given offset
+func (l *Log) ReadBatch(startOffset int64, maxBytes int64) ([][]byte, int64, error) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	var messages [][]byte
+	var totalBytes int64
+	currentOffset := startOffset
+
+	// Find the segment that contains the start offset
+	startIdx := -1
+	for i := len(l.segments) - 1; i >= 0; i-- {
+		if startOffset >= l.segments[i].BaseOffset() {
+			startIdx = i
+			break
+		}
+	}
+
+	if startIdx == -1 {
+		return nil, startOffset, fmt.Errorf("offset %d not found in any segment", startOffset)
+	}
+
+	// Read from segments
+	for i := startIdx; i < len(l.segments) && totalBytes < maxBytes; i++ {
+		segment := l.segments[i]
+
+		// Read messages from this segment
+		for offset := currentOffset; totalBytes < maxBytes; offset++ {
+			msg, err := segment.Read(offset)
+			if err != nil {
+				// Reached end of this segment, move to next
+				break
+			}
+
+			msgSize := int64(len(msg))
+			if totalBytes+msgSize > maxBytes && len(messages) > 0 {
+				// Would exceed max bytes, stop here
+				return messages, currentOffset, nil
+			}
+
+			messages = append(messages, msg)
+			totalBytes += msgSize
+			currentOffset = offset + 1
+		}
+	}
+
+	return messages, currentOffset, nil
+}
+
+// GetLogEndOffset returns the log end offset (LEO)
+func (l *Log) GetLogEndOffset() int64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if l.activeSegment == nil {
+		return 0
+	}
+
+	return l.activeSegment.NextOffset()
+}
+
+// GetBaseOffset returns the earliest offset in the log
+func (l *Log) GetBaseOffset() int64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if len(l.segments) == 0 {
+		return 0
+	}
+
+	return l.segments[0].BaseOffset()
+}
