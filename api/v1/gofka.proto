@@ -10,6 +10,8 @@ option go_package = "github.com/user/gofka/api/v1;gofkav1";
 message ProduceRequest {
   string topic = 1;
   repeated bytes messages = 2;
+  int32 acks = 3; // 0 = no ack, 1 = leader ack, -1 = all ISR ack
+  int32 timeout_ms = 4; // timeout for acks
 }
 
 // Example: ProduceResponse represents a response to a produce request.
@@ -156,6 +158,45 @@ message LeaveGroupResponse {
   string error = 2;
 }
 
+// Replication messages for inter-broker communication
+message ReplicaFetchRequest {
+  string topic = 1;
+  int32 partition = 2;
+  int64 fetch_offset = 3;
+  int64 max_bytes = 4;
+  string replica_id = 5;
+}
+
+message ReplicaFetchResponse {
+  string topic = 1;
+  int32 partition = 2;
+  int64 high_watermark = 3;
+  int64 log_end_offset = 4;
+  repeated LogRecord records = 5;
+  string error = 6;
+}
+
+message LogRecord {
+  int64 offset = 1;
+  bytes key = 2;
+  bytes value = 3;
+  int64 timestamp = 4;
+}
+
+message ReplicaHeartbeatRequest {
+  string replica_id = 1;
+  string topic = 2;
+  int32 partition = 3;
+  int64 current_offset = 4;
+}
+
+message ReplicaHeartbeatResponse {
+  bool success = 1;
+  int64 high_watermark = 2;
+  string leader_id = 3;
+  string error = 4;
+}
+
 message Request {
   oneof value {
     ProduceRequest produce_request = 1;
@@ -168,6 +209,8 @@ message Request {
     HeartbeatRequest heartbeat_request = 8;
     SyncGroupRequest sync_group_request = 9;
     LeaveGroupRequest leave_group_request = 10;
+    ReplicaFetchRequest replica_fetch_request = 11;
+    ReplicaHeartbeatRequest replica_heartbeat_request = 12;
   }
 }
 
@@ -183,6 +226,8 @@ message Response {
     HeartbeatResponse heartbeat_response = 8;
     SyncGroupResponse sync_group_response = 9;
     LeaveGroupResponse leave_group_response = 10;
+    ReplicaFetchResponse replica_fetch_response = 11;
+    ReplicaHeartbeatResponse replica_heartbeat_response = 12;
   }
 }
 
@@ -198,4 +243,6 @@ service GofkaService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc SyncGroup(SyncGroupRequest) returns (SyncGroupResponse);
   rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+  rpc ReplicaFetch(ReplicaFetchRequest) returns (ReplicaFetchResponse);
+  rpc ReplicaHeartbeat(ReplicaHeartbeatRequest) returns (ReplicaHeartbeatResponse);
 }
