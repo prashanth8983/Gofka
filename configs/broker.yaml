@@ -1,0 +1,19 @@
+# Configuration for the Gofka Broker
+
+# Broker ID (unique identifier for this broker in the cluster)
+broker.id: 0
+
+# List of KRaft controller servers (host:port)
+kraft.controllers: "localhost:9093"
+
+# Network listeners for clients (host:port)
+listeners: "PLAINTEXT://:9092"
+
+# Directory for storing log segments
+log.dirs: "/tmp/gofka-logs"
+
+# Number of partitions for new topics by default
+num.partitions: 1
+
+# Default replication factor for new topics
+default.replication.factor: 1

@@ -1,0 +1,16 @@
+# Configuration for Gofka Connect in standalone mode
+
+# REST API port for Connect
+rest.port: 8083
+
+# Directory for storing connector and task configurations
+config.storage.file: "/tmp/gofka-connect-configs.properties"
+
+# Directory for storing offsets
+offset.storage.file: "/tmp/gofka-connect-offsets.properties"
+
+# Directory for storing status updates
+status.storage.file: "/tmp/gofka-connect-status.properties"
+
+# Plugin path for custom connectors
+plugin.path: "/usr/local/share/gofka/plugins"
