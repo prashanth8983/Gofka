@@ -126,7 +126,23 @@ go build -o /tmp/simple-producer examples/simple-producer/main.go
 go build -o /tmp/simple-consumer examples/simple-consumer/main.go
 ```
 
-### 4.3. Running the Cluster
+### 4.3. Running Tests
+
+Run the comprehensive test suite:
+
+```bash
+# Run all tests
+go test ./...
+
+# Run tests with coverage
+go test -cover ./...
+
+# Run tests for specific package
+go test ./pkg/broker
+go test ./pkg/log
+```
+
+### 4.4. Running the Cluster
 
 1.  **Start the Gofka Controller:**
     Open a new terminal and run:
