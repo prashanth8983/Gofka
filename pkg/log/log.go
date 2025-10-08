@@ -2,7 +2,6 @@ package log
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,7 +33,7 @@ func NewLog(dir string) (*Log, error) {
 }
 
 func (l *Log) loadSegments() error {
-	files, err := ioutil.ReadDir(l.dir)
+	files, err := os.ReadDir(l.dir)
 	if err != nil {
 		return fmt.Errorf("failed to read log directory: %w", err)
 	}
