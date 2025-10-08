@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,12 +12,14 @@ import (
 	"sync"
 	"time"
 
+	gofkav1 "github.com/user/gofka/api/v1"
 	"github.com/user/gofka/pkg/kraft"
 	"github.com/user/gofka/pkg/log"
 	"github.com/user/gofka/pkg/metadata"
 	"github.com/user/gofka/pkg/network"
 	"github.com/user/gofka/pkg/network/protocol"
 	"github.com/user/gofka/pkg/storage"
+	"google.golang.org/grpc"
 )
 
 // Broker handles message processing and storage.
@@ -30,6 +33,7 @@ type Broker struct {
 	logs          map[string]*log.Log
 	storage       *storage.DiskStorage
 	server        *network.Server
+	grpcServer    *grpc.Server
 	consensus     *kraft.Consensus
 	metadataStore *metadata.MetadataStore
 
@@ -51,6 +55,20 @@ type Broker struct {
 
 // NewBroker creates a new Broker instance.
 func NewBroker(nodeID, addr, logDir, raftAddr, raftDir string) (*Broker, error) {
+	// Input validation
+	if nodeID == "" {
+		return nil, fmt.Errorf("node ID cannot be empty")
+	}
+	if logDir == "" {
+		return nil, fmt.Errorf("log directory cannot be empty")
+	}
+	if raftAddr == "" {
+		return nil, fmt.Errorf("raft address cannot be empty")
+	}
+	if raftDir == "" {
+		return nil, fmt.Errorf("raft directory cannot be empty")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	b := &Broker{
@@ -154,13 +172,191 @@ func (b *Broker) Start(bootstrap bool, peers []string) error {
 		return fmt.Errorf("failed to start offset manager: %w", err)
 	}
 
-	// Start network server
+	// Start network server (binary protocol)
 	if err := b.server.Start(); err != nil {
 		return fmt.Errorf("failed to start network server: %w", err)
 	}
 
+	// Start gRPC server (for cluster management and replication)
+	if err := b.startGRPCServer(); err != nil {
+		return fmt.Errorf("failed to start gRPC server: %w", err)
+	}
+
+	// If not bootstrapping and we have peers, try to join the cluster
+	if !bootstrap && len(peers) > 0 {
+		go b.attemptJoinCluster(peers)
+	}
+
 	fmt.Printf("Broker started successfully on %s\n", b.addr)
 	return nil
+}
+
+// startGRPCServer starts the gRPC server for cluster management
+func (b *Broker) startGRPCServer() error {
+	// Extract port from broker address
+	port := 9092
+	if b.addr != "" {
+		if strings.Contains(b.addr, ":") {
+			parts := strings.Split(b.addr, ":")
+			if len(parts) == 2 && parts[1] != "" {
+				if p, err := strconv.Atoi(parts[1]); err == nil {
+					port = p
+				}
+			}
+		}
+	}
+
+	// Use port + 1000 for gRPC (e.g., 9092 -> 10092)
+	grpcPort := port + 1000
+	grpcAddr := fmt.Sprintf(":%d", grpcPort)
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", grpcAddr, err)
+	}
+
+	b.grpcServer = grpc.NewServer()
+	gofkav1.RegisterGofkaServiceServer(b.grpcServer, &grpcBrokerWrapper{broker: b})
+
+	go func() {
+		fmt.Printf("gRPC server listening on %s\n", grpcAddr)
+		if err := b.grpcServer.Serve(lis); err != nil {
+			fmt.Printf("gRPC server error: %v\n", err)
+		}
+	}()
+
+	return nil
+}
+
+// attemptJoinCluster tries to join an existing cluster
+func (b *Broker) attemptJoinCluster(peers []string) {
+	fmt.Printf("Attempting to join cluster via peers: %v\n", peers)
+
+	// Wait a bit for the network server to be fully ready
+	time.Sleep(2 * time.Second)
+
+	// Try each peer to find the leader
+	for _, peerRaftAddr := range peers {
+		if peerRaftAddr == "" {
+			continue
+		}
+
+		// Convert Raft address to broker address (port - 10000)
+		brokerAddr := convertRaftAddrToBrokerAddr(peerRaftAddr)
+		if brokerAddr == "" {
+			fmt.Printf("Could not convert Raft address: %s\n", peerRaftAddr)
+			continue
+		}
+
+		fmt.Printf("Sending join request to broker at %s\n", brokerAddr)
+
+		// Use the broker client to send join request
+		client := NewBrokerClient()
+		defer client.Close()
+
+		if err := client.Connect(brokerAddr); err != nil {
+			fmt.Printf("Failed to connect to broker %s: %v\n", brokerAddr, err)
+			continue
+		}
+
+		// Send join cluster request
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		grpcClient := client.clients[brokerAddr]
+		resp, err := grpcClient.JoinCluster(ctx, &gofkav1.JoinClusterRequest{
+			NodeId:        b.nodeID,
+			RaftAddress:   b.raftAddr,
+			BrokerAddress: b.addr,
+		})
+
+		if err != nil {
+			fmt.Printf("Join cluster RPC failed for %s: %v\n", brokerAddr, err)
+			continue
+		}
+
+		if resp.Success {
+			fmt.Printf("Successfully joined cluster via %s\n", brokerAddr)
+			return
+		}
+
+		// If not the leader, try the leader address
+		if !resp.IsLeader && resp.LeaderAddress != "" {
+			fmt.Printf("Peer %s is not leader, redirecting to leader at %s\n", brokerAddr, resp.LeaderAddress)
+
+			// Convert leader's Raft address to gRPC address
+			leaderGrpcAddr := convertRaftAddrToBrokerAddr(resp.LeaderAddress)
+			if leaderGrpcAddr == "" {
+				fmt.Printf("Could not convert leader Raft address: %s\n", resp.LeaderAddress)
+				continue
+			}
+
+			fmt.Printf("Retrying join request to leader at %s\n", leaderGrpcAddr)
+
+			// Create new client for leader
+			leaderClient := NewBrokerClient()
+			defer leaderClient.Close()
+
+			leaderConn, err := grpc.Dial(leaderGrpcAddr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(10*time.Second))
+			if err != nil {
+				fmt.Printf("Failed to connect to leader %s: %v\n", leaderGrpcAddr, err)
+				continue
+			}
+			defer leaderConn.Close()
+
+			leaderGrpcClient := gofkav1.NewGofkaServiceClient(leaderConn)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			leaderResp, err := leaderGrpcClient.JoinCluster(ctx, &gofkav1.JoinClusterRequest{
+				NodeId:        b.nodeID,
+				RaftAddress:   b.raftAddr,
+				BrokerAddress: b.addr,
+			})
+
+			if err != nil {
+				fmt.Printf("Failed to send join request to leader: %v\n", err)
+				continue
+			}
+
+			if leaderResp.Success {
+				fmt.Printf("Successfully joined cluster via leader at %s\n", leaderGrpcAddr)
+				return
+			}
+
+			fmt.Printf("Leader join failed: %s\n", leaderResp.Error)
+			continue
+		}
+
+		fmt.Printf("Join failed at %s: %s\n", brokerAddr, resp.Error)
+	}
+
+	fmt.Println("Warning: Could not join cluster through any peer")
+}
+
+// convertRaftAddrToBrokerAddr converts Raft address to gRPC broker address
+func convertRaftAddrToBrokerAddr(raftAddr string) string {
+	parts := strings.Split(raftAddr, ":")
+	if len(parts) != 2 {
+		return ""
+	}
+
+	host := parts[0]
+	var raftPort int
+	if _, err := fmt.Sscanf(parts[1], "%d", &raftPort); err != nil {
+		return ""
+	}
+
+	// Convert Raft port to broker port, then add 1000 for gRPC
+	// e.g., raft:19092 -> broker:9092 -> gRPC:10092
+	brokerPort := raftPort - 10000
+	if brokerPort <= 0 {
+		return ""
+	}
+
+	grpcPort := brokerPort + 1000
+
+	return fmt.Sprintf("%s:%d", host, grpcPort)
 }
 
 // Stop stops the broker.
@@ -174,6 +370,11 @@ func (b *Broker) Stop() error {
 	b.mu.Unlock()
 
 	b.cancel()
+
+	// Stop gRPC server
+	if b.grpcServer != nil {
+		b.grpcServer.GracefulStop()
+	}
 
 	// Stop network server first to stop accepting new requests
 	if err := b.server.Stop(); err != nil {
