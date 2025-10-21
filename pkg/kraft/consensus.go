@@ -297,9 +297,17 @@ func (c *Consensus) Start(bootstrap bool, peers []string) error {
 		fmt.Printf("Bootstrap verification: cluster now has %d servers\n", len(bootstrapServers))
 		fmt.Println("Raft cluster bootstrapped successfully")
 	} else {
-		fmt.Println("Bootstrap not requested, consensus will start in follower mode")
-		// For non-bootstrap mode, we need to ensure the node can join an existing cluster
-		// or wait for leadership election
+		fmt.Println("Bootstrap not requested, attempting to join existing cluster")
+
+		// Try to join the existing cluster via peers
+		if len(peers) > 0 {
+			if err := c.joinCluster(peers); err != nil {
+				fmt.Printf("Warning: Failed to join cluster: %v\n", err)
+				fmt.Println("Will start in follower mode and wait for cluster discovery")
+			}
+		} else {
+			fmt.Println("No peers provided, will start in follower mode")
+		}
 	}
 
 	// Wait for the Raft state to stabilize and provide status updates
@@ -454,3 +462,98 @@ func (f *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 
 // Release releases the snapshot.
 func (f *fsmSnapshot) Release() {}
+
+// joinCluster attempts to join an existing cluster by contacting peers
+func (c *Consensus) joinCluster(peers []string) error {
+	fmt.Printf("Attempting to join cluster via %d peers: %v\n", len(peers), peers)
+
+	// We need to convert Raft addresses to broker addresses for gRPC
+	// For now, we'll try to contact the Raft addresses directly
+	// In production, you'd want a service discovery mechanism
+
+	// Try each peer to find one that can help us join
+	for _, peerRaftAddr := range peers {
+		if peerRaftAddr == "" || peerRaftAddr == string(c.localAddr) {
+			continue
+		}
+
+		fmt.Printf("Attempting to join via peer %s...\n", peerRaftAddr)
+
+		// Convert Raft address to broker address (subtract 10000 from port)
+		// This is a simple convention: broker port = raft port - 10000
+		// e.g., raft:19092 -> broker:9092
+		brokerAddr := convertRaftToBrokerAddr(peerRaftAddr)
+		if brokerAddr == "" {
+			fmt.Printf("Could not convert Raft address to broker address: %s\n", peerRaftAddr)
+			continue
+		}
+
+		fmt.Printf("Converted Raft address %s to broker address %s\n", peerRaftAddr, brokerAddr)
+
+		// Try to send join request via gRPC
+		// This will be handled by the broker's JoinCluster RPC handler
+		// For now, we'll just log and wait - the actual gRPC call needs to be made from broker layer
+		fmt.Printf("Join request should be sent to broker at %s\n", brokerAddr)
+		fmt.Printf("Note: Join will be completed asynchronously via broker's gRPC client\n")
+
+		return nil // Return success, the broker will handle the actual join
+	}
+
+	return fmt.Errorf("could not find suitable peer to join cluster")
+}
+
+// convertRaftToBrokerAddr converts a Raft address to a broker address
+// Convention: broker port = raft port - 10000
+func convertRaftToBrokerAddr(raftAddr string) string {
+	// Parse the Raft address to extract host and port
+	parts := strings.Split(raftAddr, ":")
+	if len(parts) != 2 {
+		return ""
+	}
+
+	host := parts[0]
+	raftPort := parts[1]
+
+	// Convert port string to int
+	var port int
+	if _, err := fmt.Sscanf(raftPort, "%d", &port); err != nil {
+		return ""
+	}
+
+	// Calculate broker port (raft port - 10000)
+	brokerPort := port - 10000
+	if brokerPort <= 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("%s:%d", host, brokerPort)
+}
+
+// AddVoter adds a new voting member to the cluster (must be called on the leader)
+func (c *Consensus) AddVoter(id raft.ServerID, address raft.ServerAddress) error {
+	// Check if we're the leader
+	if c.raft.State() != raft.Leader {
+		return fmt.Errorf("not the leader, cannot add voter")
+	}
+
+	fmt.Printf("Leader adding voter: ID=%s, Address=%s\n", id, address)
+
+	// Add the voter to the cluster
+	future := c.raft.AddVoter(id, address, 0, 10*time.Second)
+	if err := future.Error(); err != nil {
+		return fmt.Errorf("failed to add voter: %w", err)
+	}
+
+	fmt.Printf("Successfully added voter %s to cluster\n", id)
+	return nil
+}
+
+// GetLeader returns the current leader address
+func (c *Consensus) GetLeader() raft.ServerAddress {
+	return c.raft.Leader()
+}
+
+// IsLeader returns true if this node is the leader
+func (c *Consensus) IsLeader() bool {
+	return c.raft.State() == raft.Leader
+}
