@@ -67,3 +67,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - Basic input validation for message production
 - Safe file handling for log segments
+
+

@@ -175,6 +175,27 @@ go test ./pkg/log
 
 You should see the producer sending messages and the consumer receiving them.
 
-## 5. Contributing
+## 5. Client Libraries
+
+Gofka provides client libraries for multiple programming languages. Each client is maintained in a separate repository:
+
+### Available Clients
+
+- **Python**: [gofka-python](https://github.com/prashanth8983/gofka-python)
+  - Synchronous and asynchronous APIs
+  - Producer, Consumer, and Admin clients
+  - Zero external dependencies
+  - Installation: `pip install gofka`
+
+### Coming Soon
+
+- **Go**: In development
+- **Node.js**: Planned
+
+### Internal Go Client
+
+The `pkg/client` package provides a Go client for internal use and examples. For production Go applications, we recommend waiting for the dedicated `gofka-go` client library.
+
+## 6. Contributing
 
 Contributions are welcome! Please refer to the contributing guidelines (to be added) for more information.
