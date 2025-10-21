@@ -197,6 +197,20 @@ message ReplicaHeartbeatResponse {
   string error = 4;
 }
 
+// Cluster membership messages
+message JoinClusterRequest {
+  string node_id = 1;
+  string raft_address = 2;
+  string broker_address = 3;
+}
+
+message JoinClusterResponse {
+  bool success = 1;
+  string error = 2;
+  string leader_address = 3;
+  bool is_leader = 4;
+}
+
 message Request {
   oneof value {
     ProduceRequest produce_request = 1;
@@ -245,4 +259,5 @@ service GofkaService {
   rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
   rpc ReplicaFetch(ReplicaFetchRequest) returns (ReplicaFetchResponse);
   rpc ReplicaHeartbeat(ReplicaHeartbeatRequest) returns (ReplicaHeartbeatResponse);
+  rpc JoinCluster(JoinClusterRequest) returns (JoinClusterResponse);
 }
