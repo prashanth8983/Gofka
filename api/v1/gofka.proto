@@ -2,16 +2,32 @@ syntax = "proto3";
 
 package gofka.v1;
 
-option go_package = "github.com/user/gofka/api/v1;gofkav1";
+option go_package = "github.com/prashanth8983/gofka/api/v1;gofkav1";
 
 // Define your Gofka API services and messages here.
+
+// MessageHeader represents a key-value header pair
+message MessageHeader {
+  string key = 1;
+  bytes value = 2;
+}
+
+// Message represents a message with optional headers
+message Message {
+  bytes key = 1;
+  bytes value = 2;
+  repeated MessageHeader headers = 3;
+  int64 timestamp = 4;
+  uint32 crc = 5; // CRC32 checksum of the message
+}
 
 // Example: ProduceRequest represents a request to produce messages.
 message ProduceRequest {
   string topic = 1;
-  repeated bytes messages = 2;
+  repeated bytes messages = 2; // Legacy: raw message bytes
   int32 acks = 3; // 0 = no ack, 1 = leader ack, -1 = all ISR ack
   int32 timeout_ms = 4; // timeout for acks
+  repeated Message records = 5; // New: messages with headers support
 }
 
 // Example: ProduceResponse represents a response to a produce request.
@@ -29,7 +45,8 @@ message ConsumeRequest {
 
 // ConsumeResponse represents a response to a consume request.
 message ConsumeResponse {
-  repeated bytes messages = 1;
+  repeated bytes messages = 1; // Legacy: raw message bytes
+  repeated Message records = 2; // New: messages with headers support
 }
 
 // MetadataRequest represents a request for cluster metadata.
@@ -181,6 +198,8 @@ message LogRecord {
   bytes key = 2;
   bytes value = 3;
   int64 timestamp = 4;
+  repeated MessageHeader headers = 5; // Optional headers
+  uint32 crc = 6; // CRC32 checksum of the record
 }
 
 message ReplicaHeartbeatRequest {
