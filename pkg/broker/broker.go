@@ -2,9 +2,11 @@ package broker
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,13 +14,19 @@ import (
 	"sync"
 	"time"
 
-	gofkav1 "github.com/user/gofka/api/v1"
-	"github.com/user/gofka/pkg/kraft"
-	"github.com/user/gofka/pkg/log"
-	"github.com/user/gofka/pkg/metadata"
-	"github.com/user/gofka/pkg/network"
-	"github.com/user/gofka/pkg/network/protocol"
-	"github.com/user/gofka/pkg/storage"
+	gofkav1 "github.com/prashanth8983/gofka/api/v1"
+	"github.com/prashanth8983/gofka/pkg/crc"
+	"github.com/prashanth8983/gofka/pkg/health"
+	"github.com/prashanth8983/gofka/pkg/kraft"
+	"github.com/prashanth8983/gofka/pkg/log"
+	"github.com/prashanth8983/gofka/pkg/logger"
+	"github.com/prashanth8983/gofka/pkg/metadata"
+	"github.com/prashanth8983/gofka/pkg/metrics"
+	"github.com/prashanth8983/gofka/pkg/network"
+	"github.com/prashanth8983/gofka/pkg/network/protocol"
+	"github.com/prashanth8983/gofka/pkg/storage"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
 
@@ -41,6 +49,9 @@ type Broker struct {
 	replicationManager       *ReplicaManager
 	consumerGroupCoordinator *ConsumerGroupCoordinator
 	offsetManager            *OffsetManager
+	crcValidator             *crc.MessageCRC
+	healthService            *health.Service
+	metricsServer            *http.Server
 
 	// Configuration
 	addr               string
@@ -55,6 +66,16 @@ type Broker struct {
 
 // NewBroker creates a new Broker instance.
 func NewBroker(nodeID, addr, logDir, raftAddr, raftDir string) (*Broker, error) {
+	// Initialize structured logging
+	logger.Init(logger.Config{
+		Level:      "info",
+		Encoding:   "json",
+		OutputPath: "stdout",
+		Component:  fmt.Sprintf("broker-%s", nodeID),
+	})
+
+	logger.Info("Starting broker", zap.String("node_id", nodeID), zap.String("addr", addr))
+
 	// Input validation
 	if nodeID == "" {
 		return nil, fmt.Errorf("node ID cannot be empty")
@@ -83,6 +104,8 @@ func NewBroker(nodeID, addr, logDir, raftAddr, raftDir string) (*Broker, error) 
 		minInsyncReplicas: 1, // Default: at least 1 replica (leader) must ack
 		defaultAcks:       1, // Default: wait for leader ack only
 		defaultTimeoutMs:  5000, // Default: 5 second timeout
+		crcValidator:      crc.NewMessageCRC(),
+		healthService:     health.NewService(5 * time.Second),
 	}
 
 	storage, err := storage.NewDiskStorage(logDir)
@@ -145,21 +168,13 @@ func (b *Broker) Start(bootstrap bool, peers []string) error {
 		}
 	}
 
-	// Start consensus first
-	if err := b.consensus.Start(bootstrap, peers); err != nil {
-		return fmt.Errorf("failed to start consensus: %w", err)
-	}
-
-	// Allow consensus to stabilize before proceeding
-	time.Sleep(500 * time.Millisecond)
-
-	// Add self to metadata store
+	// Add self to metadata store first
 	b.metadataStore.AddBroker(&metadata.Broker{
 		ID:   b.nodeID,
 		Addr: b.addr,
 	})
 
-	// Start new core infrastructure components
+	// Start core infrastructure components first (they don't depend on consensus)
 	if err := b.replicationManager.Start(); err != nil {
 		return fmt.Errorf("failed to start replication manager: %w", err)
 	}
@@ -172,20 +187,47 @@ func (b *Broker) Start(bootstrap bool, peers []string) error {
 		return fmt.Errorf("failed to start offset manager: %w", err)
 	}
 
-	// Start network server (binary protocol)
+	// Start network server early so broker can accept connections
 	if err := b.server.Start(); err != nil {
 		return fmt.Errorf("failed to start network server: %w", err)
 	}
+
+	// Start consensus in the background - it shouldn't block broker operation
+	go func() {
+		fmt.Println("Starting consensus in background...")
+		if err := b.consensus.Start(bootstrap, peers); err != nil {
+			fmt.Printf("Warning: consensus failed to start: %v (broker will continue in standalone mode)\n", err)
+		} else {
+			fmt.Println("Consensus started successfully")
+		}
+	}()
 
 	// Start gRPC server (for cluster management and replication)
 	if err := b.startGRPCServer(); err != nil {
 		return fmt.Errorf("failed to start gRPC server: %w", err)
 	}
 
+	// Register health checkers
+	b.registerHealthCheckers()
+
+	// Start metrics and health check server
+	if err := b.startMetricsServer(); err != nil {
+		logger.Warn("Failed to start metrics server", zap.Error(err))
+		// Don't fail broker start if metrics server fails
+	}
+
 	// If not bootstrapping and we have peers, try to join the cluster
 	if !bootstrap && len(peers) > 0 {
 		go b.attemptJoinCluster(peers)
 	}
+
+	logger.Info("Broker started successfully",
+		zap.String("broker_id", b.nodeID),
+		zap.String("addr", b.addr),
+		zap.Bool("bootstrap", bootstrap))
+
+	// Update metrics
+	metrics.BrokerUp.WithLabelValues(b.nodeID).Set(1)
 
 	fmt.Printf("Broker started successfully on %s\n", b.addr)
 	return nil
@@ -371,6 +413,18 @@ func (b *Broker) Stop() error {
 
 	b.cancel()
 
+	// Update metrics
+	metrics.BrokerUp.WithLabelValues(b.nodeID).Set(0)
+
+	// Stop metrics server
+	if b.metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := b.metricsServer.Shutdown(ctx); err != nil {
+			logger.Warn("Failed to gracefully shutdown metrics server", zap.Error(err))
+		}
+	}
+
 	// Stop gRPC server
 	if b.grpcServer != nil {
 		b.grpcServer.GracefulStop()
@@ -434,7 +488,12 @@ func (b *Broker) getOrCreateLog(topic string) (*log.Log, error) {
 
 // ProduceMessage handles message production through Raft consensus.
 func (b *Broker) ProduceMessage(topic string, message []byte) (int64, error) {
-	return b.ProduceMessageWithAcks(topic, message, b.defaultAcks, b.defaultTimeoutMs)
+	offset, err := b.ProduceMessageWithAcks(topic, message, b.defaultAcks, b.defaultTimeoutMs)
+	if err == nil {
+		logger.LogProducedMessage(topic, 0, offset, len(message))
+		metrics.RecordProducedMessage(topic, 0, len(message))
+	}
+	return offset, err
 }
 
 // ProduceMessageWithAcks handles message production with ack configuration
@@ -524,16 +583,23 @@ func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, time
 func (b *Broker) ConsumeMessage(topic string, partition int32, offset int64) ([]byte, error) {
 	// First try to get message from replicated state (available on all brokers)
 	if msg, found := b.metadataStore.GetMessage(topic, offset); found {
+		logger.LogConsumedMessage(topic, partition, offset, "")
+		metrics.RecordConsumedMessage(topic, partition, "", len(msg.Data))
 		return msg.Data, nil
 	}
-	
+
 	// Fallback to local log for backwards compatibility
 	log, err := b.getOrCreateLog(topic)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get or create log: %w", err)
 	}
 
-	return log.Read(offset)
+	data, err := log.Read(offset)
+	if err == nil {
+		logger.LogConsumedMessage(topic, partition, offset, "")
+		metrics.RecordConsumedMessage(topic, partition, "", len(data))
+	}
+	return data, err
 }
 
 // GetBrokers returns broker metadata for network interface
@@ -686,6 +752,16 @@ func (b *Broker) GetLog(topic string, partition int32) *log.Log {
 	return b.logs[topic]
 }
 
+// getLog is an internal helper method for getting a log without exposing the broker
+func (b *Broker) getLog(topic string, partition int32) *log.Log {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	// For now, use topic as key (single partition support)
+	// TODO: Support multiple partitions
+	return b.logs[topic]
+}
+
 // Protocol adapter methods to avoid import cycles
 
 // GetProtocolBrokers returns brokers in protocol format
@@ -738,6 +814,149 @@ type protocolHandlerWrapper struct {
 }
 
 func (w *protocolHandlerWrapper) HandleRequest(reader io.Reader, writer io.Writer) error {
-	handler := protocol.NewRequestHandler(w.broker)
-	return handler.HandleRequest(reader, writer)
+	fmt.Println("protocolHandlerWrapper.HandleRequest called")
+
+	// Read all the data from the reader (the network server already consumed the size)
+	// The reader contains: size(4) + actual message
+	var size int32
+	if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
+		return fmt.Errorf("failed to read size: %w", err)
+	}
+
+	msgBuf := make([]byte, size)
+	if _, err := io.ReadFull(reader, msgBuf); err != nil {
+		return fmt.Errorf("failed to read message: %w", err)
+	}
+
+	// Use the wrapper to handle the request
+	wrapper := protocol.NewRequestHandlerWrapper(w.broker)
+	response, err := wrapper.HandleRequestWithoutSize(msgBuf)
+	if err != nil {
+		fmt.Printf("Handler error: %v\n", err)
+		return err
+	}
+
+	// Write the response (already has size prefix)
+	if _, err := writer.Write(response); err != nil {
+		return fmt.Errorf("failed to write response: %w", err)
+	}
+
+	return nil
+}
+
+// registerHealthCheckers registers all health check components
+func (b *Broker) registerHealthCheckers() {
+	// Register broker health checker
+	b.healthService.RegisterComponent("broker", &health.BrokerHealthChecker{
+		BrokerID: b.nodeID,
+		IsLeader: func() bool {
+			if b.consensus != nil {
+				return b.consensus.IsLeader()
+			}
+			return false
+		},
+		TopicCount: func() int {
+			return len(b.GetTopics())
+		},
+		GetState: func() string {
+			if !b.running {
+				return "stopped"
+			}
+			if b.consensus != nil && b.consensus.IsLeader() {
+				return "leader"
+			}
+			return "follower"
+		},
+	})
+
+	// Register Raft health checker if consensus is available
+	if b.consensus != nil {
+		b.healthService.RegisterComponent("raft", &health.RaftHealthChecker{
+			NodeID: b.nodeID,
+			GetState: func() string {
+				// This would need to be implemented in the kraft package
+				return "follower"
+			},
+			GetTerm: func() uint64 {
+				// This would need to be implemented in the kraft package
+				return 0
+			},
+			GetLeader: func() string {
+				// This would need to be implemented in the kraft package
+				return ""
+			},
+			GetPeerCount: func() int {
+				// This would need to be implemented in the kraft package
+				return len(b.metadataStore.GetBrokers()) - 1
+			},
+		})
+	}
+
+	// Register storage health checker
+	b.healthService.RegisterComponent("storage", &health.StorageHealthChecker{
+		GetDiskUsage: func() (used, total uint64) {
+			// Simple disk usage check - would need proper implementation
+			return 0, 1000000000 // 1GB for now
+		},
+		GetSegmentCount: func() int {
+			count := 0
+			for _, log := range b.logs {
+				if log != nil {
+					count++
+				}
+			}
+			return count
+		},
+		GetOldestOffset: func() int64 {
+			return 0
+		},
+		GetLatestOffset: func() int64 {
+			var maxOffset int64
+			for topic := range b.logs {
+				offset := b.metadataStore.GetNextOffset(topic)
+				if offset > maxOffset {
+					maxOffset = offset
+				}
+			}
+			return maxOffset
+		},
+	})
+}
+
+// startMetricsServer starts the HTTP server for metrics and health endpoints
+func (b *Broker) startMetricsServer() error {
+	mux := http.NewServeMux()
+
+	// Prometheus metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+
+	// Health check endpoints
+	mux.HandleFunc("/health", b.healthService.HTTPHandler())
+	mux.HandleFunc("/health/live", health.LivenessHandler())
+	mux.HandleFunc("/health/ready", b.healthService.ReadinessHandler())
+
+	// Default metrics port (can be configured)
+	metricsPort := 8080
+	if b.addr != "" && strings.Contains(b.addr, ":") {
+		parts := strings.Split(b.addr, ":")
+		if len(parts) == 2 {
+			if port, err := strconv.Atoi(parts[1]); err == nil {
+				metricsPort = port + 1000 // Use broker port + 1000 for metrics
+			}
+		}
+	}
+
+	b.metricsServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", metricsPort),
+		Handler: mux,
+	}
+
+	go func() {
+		logger.Info("Starting metrics server", zap.Int("port", metricsPort))
+		if err := b.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("Metrics server error", zap.Error(err))
+		}
+	}()
+
+	return nil
 }

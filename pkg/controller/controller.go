@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/user/gofka/pkg/kraft"
-	"github.com/user/gofka/pkg/metadata"
+	"github.com/prashanth8983/gofka/pkg/kraft"
+	"github.com/prashanth8983/gofka/pkg/metadata"
 )
 
 // Controller manages the cluster metadata.

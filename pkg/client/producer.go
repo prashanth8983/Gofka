@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/gofka/api/v1"
+	"github.com/prashanth8983/gofka/api/v1"
 	"google.golang.org/protobuf/proto"
 )
 

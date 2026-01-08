@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/user/gofka/pkg/client"
-	"github.com/user/gofka/pkg/metadata"
+	"github.com/prashanth8983/gofka/pkg/client"
+	"github.com/prashanth8983/gofka/pkg/metadata"
 )
 
 // Processor is an interface for stream processing operations.

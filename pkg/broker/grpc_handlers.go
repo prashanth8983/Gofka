@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	gofkav1 "github.com/user/gofka/api/v1"
+	gofkav1 "github.com/prashanth8983/gofka/api/v1"
 )
 
 // grpcBrokerWrapper wraps the broker to implement gRPC service interface

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/user/gofka/pkg/broker"
+	"github.com/prashanth8983/gofka/pkg/broker"
 )
 
 func main() {

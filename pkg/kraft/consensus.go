@@ -12,7 +12,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
-	"github.com/user/gofka/pkg/metadata"
+	"github.com/prashanth8983/gofka/pkg/metadata"
 )
 
 // Consensus manages the KRaft consensus protocol for metadata.

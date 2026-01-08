@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	gofkav1 "github.com/user/gofka/api/v1"
+	gofkav1 "github.com/prashanth8983/gofka/api/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

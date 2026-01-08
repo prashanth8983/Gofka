@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/user/gofka/pkg/storage"
+	"github.com/prashanth8983/gofka/pkg/storage"
 )
 
 // Segment represents a single log segment file.

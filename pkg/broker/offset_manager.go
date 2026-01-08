@@ -16,11 +16,28 @@ type OffsetManager struct {
 	offsetDir string
 
 	// In-memory offset cache
-	offsets map[string]map[string]map[int32]int64 // groupID -> topic -> partition -> offset
+	offsets map[string]map[string]map[int32]*OffsetMetadata // groupID -> topic -> partition -> offset metadata
+
+	// Leader epoch tracking
+	leaderEpochs map[string]map[int32]int32 // topic -> partition -> leader epoch
+
+	// Offset retention
+	retentionTime   time.Duration
+	compactInterval time.Duration
+	lastCompaction  time.Time
 
 	// Configuration
 	commitInterval time.Duration
 	autoCommit     bool
+}
+
+// OffsetMetadata stores detailed offset information
+type OffsetMetadata struct {
+	Offset        int64     `json:"offset"`
+	LeaderEpoch   int32     `json:"leader_epoch"`
+	Timestamp     time.Time `json:"timestamp"`
+	Metadata      string    `json:"metadata,omitempty"`
+	CommitTime    time.Time `json:"commit_time"`
 }
 
 // OffsetCommit represents an offset commit request
@@ -44,11 +61,15 @@ type OffsetFetch struct {
 // NewOffsetManager creates a new OffsetManager
 func NewOffsetManager(broker *Broker, offsetDir string) *OffsetManager {
 	return &OffsetManager{
-		broker:         broker,
-		offsetDir:      offsetDir,
-		offsets:        make(map[string]map[string]map[int32]int64),
-		commitInterval: 5 * time.Second,
-		autoCommit:     true,
+		broker:          broker,
+		offsetDir:       offsetDir,
+		offsets:         make(map[string]map[string]map[int32]*OffsetMetadata),
+		leaderEpochs:    make(map[string]map[int32]int32),
+		commitInterval:  5 * time.Second,
+		autoCommit:      true,
+		retentionTime:   7 * 24 * time.Hour, // 7 days default retention
+		compactInterval: 1 * time.Hour,       // Compact every hour
+		lastCompaction:  time.Now(),
 	}
 }
 
@@ -69,6 +90,9 @@ func (c *OffsetManager) Start() error {
 		go c.periodicCommit()
 	}
 
+	// Start offset compaction routine
+	go c.periodicCompaction()
+
 	return nil
 }
 
@@ -85,14 +109,24 @@ func (c *OffsetManager) CommitOffset(groupID, topic string, partition int32, off
 
 	// Initialize nested maps if they don't exist
 	if c.offsets[groupID] == nil {
-		c.offsets[groupID] = make(map[string]map[int32]int64)
+		c.offsets[groupID] = make(map[string]map[int32]*OffsetMetadata)
 	}
 	if c.offsets[groupID][topic] == nil {
-		c.offsets[groupID][topic] = make(map[int32]int64)
+		c.offsets[groupID][topic] = make(map[int32]*OffsetMetadata)
 	}
 
+	// Get current leader epoch
+	leaderEpoch := c.getLeaderEpoch(topic, partition)
+
 	// Update the offset
-	c.offsets[groupID][topic][partition] = offset
+	now := time.Now()
+	c.offsets[groupID][topic][partition] = &OffsetMetadata{
+		Offset:      offset,
+		LeaderEpoch: leaderEpoch,
+		Timestamp:   now,
+		Metadata:    metadata,
+		CommitTime:  now,
+	}
 
 	// Create offset commit record
 	commit := &OffsetCommit{
@@ -100,9 +134,9 @@ func (c *OffsetManager) CommitOffset(groupID, topic string, partition int32, off
 		Topic:       topic,
 		Partition:   partition,
 		Offset:      offset,
-		Timestamp:   time.Now(),
+		Timestamp:   now,
 		Metadata:    metadata,
-		LeaderEpoch: 0, // TODO: Implement leader epoch tracking
+		LeaderEpoch: leaderEpoch,
 	}
 
 	// Write to disk immediately for durability
@@ -122,12 +156,12 @@ func (c *OffsetManager) FetchOffset(groupID, topic string, partition int32) (int
 		return -1, fmt.Errorf("no offsets found for group %s, topic %s", groupID, topic)
 	}
 
-	offset, exists := c.offsets[groupID][topic][partition]
-	if !exists {
+	offsetMeta, exists := c.offsets[groupID][topic][partition]
+	if !exists || offsetMeta == nil {
 		return -1, fmt.Errorf("no offset found for group %s, topic %s, partition %d", groupID, topic, partition)
 	}
 
-	return offset, nil
+	return offsetMeta.Offset, nil
 }
 
 // GetGroupOffsets returns all offsets for a consumer group
@@ -144,8 +178,10 @@ func (c *OffsetManager) GetGroupOffsets(groupID string) (map[string]map[int32]in
 	result := make(map[string]map[int32]int64)
 	for topic, partitions := range groupOffsets {
 		result[topic] = make(map[int32]int64)
-		for partition, offset := range partitions {
-			result[topic][partition] = offset
+		for partition, offsetMeta := range partitions {
+			if offsetMeta != nil {
+				result[topic][partition] = offsetMeta.Offset
+			}
 		}
 	}
 
@@ -180,16 +216,24 @@ func (c *OffsetManager) DeleteTopicOffsets(groupID, topic string) error {
 
 // GetEarliestOffset returns the earliest available offset for a topic/partition
 func (c *OffsetManager) GetEarliestOffset(topic string, partition int32) (int64, error) {
-	// This would typically query the log segments
-	// For now, return 0 as the earliest offset
-	return 0, nil
+	// Get the log for the topic/partition
+	log := c.broker.getLog(topic, partition)
+	if log == nil {
+		return 0, fmt.Errorf("log not found for topic %s, partition %d", topic, partition)
+	}
+
+	return log.GetBaseOffset(), nil
 }
 
 // GetLatestOffset returns the latest available offset for a topic/partition
 func (c *OffsetManager) GetLatestOffset(topic string, partition int32) (int64, error) {
-	// This would typically query the log segments
-	// For now, return a placeholder value
-	return 1000, nil
+	// Get the log for the topic/partition
+	log := c.broker.getLog(topic, partition)
+	if log == nil {
+		return 0, fmt.Errorf("log not found for topic %s, partition %d", topic, partition)
+	}
+
+	return log.GetLogEndOffset(), nil
 }
 
 // ResetOffset resets the offset for a consumer group to the earliest available offset
@@ -234,7 +278,7 @@ func (c *OffsetManager) writeOffsetCommit(commit *OffsetCommit) error {
 // loadOffsets loads all offsets from disk into memory
 func (c *OffsetManager) loadOffsets() error {
 	// Clear existing offsets
-	c.offsets = make(map[string]map[string]map[int32]int64)
+	c.offsets = make(map[string]map[string]map[int32]*OffsetMetadata)
 
 	// Read all group directories
 	entries, err := os.ReadDir(c.offsetDir)
@@ -259,7 +303,7 @@ func (c *OffsetManager) loadOffsets() error {
 			continue // Skip problematic groups
 		}
 
-		c.offsets[groupID] = make(map[string]map[int32]int64)
+		c.offsets[groupID] = make(map[string]map[int32]*OffsetMetadata)
 
 		for _, topicEntry := range topicEntries {
 			if !topicEntry.IsDir() {
@@ -275,7 +319,7 @@ func (c *OffsetManager) loadOffsets() error {
 				continue // Skip problematic topics
 			}
 
-			c.offsets[groupID][topic] = make(map[int32]int64)
+			c.offsets[groupID][topic] = make(map[int32]*OffsetMetadata)
 
 			for _, partitionEntry := range partitionEntries {
 				if partitionEntry.IsDir() || filepath.Ext(partitionEntry.Name()) != ".json" {
@@ -293,7 +337,22 @@ func (c *OffsetManager) loadOffsets() error {
 					continue // Skip corrupted files
 				}
 
-				c.offsets[groupID][topic][commit.Partition] = commit.Offset
+				// Convert to OffsetMetadata
+				c.offsets[groupID][topic][commit.Partition] = &OffsetMetadata{
+					Offset:      commit.Offset,
+					LeaderEpoch: commit.LeaderEpoch,
+					Timestamp:   commit.Timestamp,
+					Metadata:    commit.Metadata,
+					CommitTime:  commit.Timestamp,
+				}
+
+				// Track leader epochs
+				if c.leaderEpochs[topic] == nil {
+					c.leaderEpochs[topic] = make(map[int32]int32)
+				}
+				if commit.LeaderEpoch > c.leaderEpochs[topic][commit.Partition] {
+					c.leaderEpochs[topic][commit.Partition] = commit.LeaderEpoch
+				}
 			}
 		}
 	}
@@ -308,15 +367,19 @@ func (c *OffsetManager) commitAllOffsets() error {
 
 	for groupID, topics := range c.offsets {
 		for topic, partitions := range topics {
-			for partition, offset := range partitions {
+			for partition, offsetMeta := range partitions {
+				if offsetMeta == nil {
+					continue
+				}
+
 				commit := &OffsetCommit{
 					GroupID:     groupID,
 					Topic:       topic,
 					Partition:   partition,
-					Offset:      offset,
-					Timestamp:   time.Now(),
-					Metadata:    "",
-					LeaderEpoch: 0,
+					Offset:      offsetMeta.Offset,
+					Timestamp:   offsetMeta.Timestamp,
+					Metadata:    offsetMeta.Metadata,
+					LeaderEpoch: offsetMeta.LeaderEpoch,
 				}
 
 				if err := c.writeOffsetCommit(commit); err != nil {
@@ -368,6 +431,126 @@ func (c *OffsetManager) GetOffsetStats() map[string]interface{} {
 	stats["total_partitions"] = totalPartitions
 	stats["auto_commit"] = c.autoCommit
 	stats["commit_interval"] = c.commitInterval.String()
+	stats["retention_time"] = c.retentionTime.String()
+	stats["compaction_interval"] = c.compactInterval.String()
+	stats["last_compaction"] = c.lastCompaction.Format(time.RFC3339)
 
 	return stats
+}
+
+// getLeaderEpoch returns the current leader epoch for a topic/partition
+func (c *OffsetManager) getLeaderEpoch(topic string, partition int32) int32 {
+	if c.leaderEpochs[topic] == nil {
+		c.leaderEpochs[topic] = make(map[int32]int32)
+	}
+	return c.leaderEpochs[topic][partition]
+}
+
+// UpdateLeaderEpoch updates the leader epoch for a topic/partition
+func (c *OffsetManager) UpdateLeaderEpoch(topic string, partition int32, epoch int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.leaderEpochs[topic] == nil {
+		c.leaderEpochs[topic] = make(map[int32]int32)
+	}
+	c.leaderEpochs[topic][partition] = epoch
+}
+
+// periodicCompaction performs periodic compaction of old offsets
+func (c *OffsetManager) periodicCompaction() {
+	ticker := time.NewTicker(c.compactInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := c.compactOffsets(); err != nil {
+			fmt.Printf("Failed to compact offsets: %v\n", err)
+		}
+	}
+}
+
+// compactOffsets removes expired offsets based on retention policy
+func (c *OffsetManager) compactOffsets() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	expiredCount := 0
+
+	// Iterate through all offsets and remove expired ones
+	for groupID, topics := range c.offsets {
+		for topic, partitions := range topics {
+			for partition, offsetMeta := range partitions {
+				if offsetMeta == nil {
+					continue
+				}
+
+				// Check if offset has expired
+				if now.Sub(offsetMeta.CommitTime) > c.retentionTime {
+					delete(partitions, partition)
+					expiredCount++
+
+					// Remove from disk
+					groupDir := filepath.Join(c.offsetDir, groupID)
+					topicDir := filepath.Join(groupDir, topic)
+					offsetFile := filepath.Join(topicDir, fmt.Sprintf("partition_%d.json", partition))
+					os.Remove(offsetFile)
+				}
+			}
+
+			// Remove topic if no partitions left
+			if len(partitions) == 0 {
+				delete(topics, topic)
+			}
+		}
+
+		// Remove group if no topics left
+		if len(topics) == 0 {
+			delete(c.offsets, groupID)
+		}
+	}
+
+	c.lastCompaction = now
+	if expiredCount > 0 {
+		fmt.Printf("Compacted %d expired offsets\n", expiredCount)
+	}
+
+	return nil
+}
+
+// FetchOffsetWithMetadata fetches the full offset metadata for a consumer group
+func (c *OffsetManager) FetchOffsetWithMetadata(groupID, topic string, partition int32) (*OffsetMetadata, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.offsets[groupID] == nil {
+		return nil, fmt.Errorf("no offsets found for group %s", groupID)
+	}
+
+	if c.offsets[groupID][topic] == nil {
+		return nil, fmt.Errorf("no offsets found for group %s, topic %s", groupID, topic)
+	}
+
+	offsetMeta, exists := c.offsets[groupID][topic][partition]
+	if !exists || offsetMeta == nil {
+		return nil, fmt.Errorf("no offset found for group %s, topic %s, partition %d", groupID, topic, partition)
+	}
+
+	// Return a copy to avoid race conditions
+	copy := *offsetMeta
+	return &copy, nil
+}
+
+// SetRetentionTime updates the offset retention time
+func (c *OffsetManager) SetRetentionTime(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.retentionTime = duration
+}
+
+// SetCompactInterval updates the compaction interval
+func (c *OffsetManager) SetCompactInterval(duration time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.compactInterval = duration
 }

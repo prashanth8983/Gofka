@@ -4,10 +4,13 @@
 *.dll
 *.so
 *.dylib
+.claude/
+scripts/*
 
 # Test binary, built with `go test -c`
 *.test
-
+test-artifacts/
+docs/*
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
@@ -43,6 +46,18 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Test artifacts and local development
+test-artifacts/
+/gofka-broker
+/gofka-controller
+/simple-producer
+/simple-consumer
+
+# Local data directories
+/tmp/
+raft-data/
+broker-logs/
 
 # Generated protobuf files
 *.pb.go

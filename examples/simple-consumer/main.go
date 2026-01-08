@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/user/gofka/pkg/client"
+	"github.com/prashanth8983/gofka/pkg/client"
 )
 
 func main() {

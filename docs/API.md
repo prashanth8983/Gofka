@@ -1,8 +1,8 @@
-# API Documentation
+# Gofka API Reference
 
-## Protocol
+## Binary Protocol
 
-Gofka uses Protocol Buffers for communication between clients and brokers. The protocol definitions are in `api/v1/gofka.proto`.
+Gofka uses a custom binary protocol with Protocol Buffers for message serialization. The protocol is optimized for performance and simplicity.
 
 ## Client Operations
 

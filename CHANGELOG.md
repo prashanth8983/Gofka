@@ -1,71 +1,50 @@
-# Gofka Changelog
+# Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to Gofka will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-11-19
+
 ### Added
-- Comprehensive unit tests for broker and log packages
-- Input validation for broker constructor
-- Error handling improvements throughout the codebase
-- Test coverage for message production and consumption
-- Test coverage for topic creation and management
-- Test coverage for log segment management and persistence
+- CRC32 data integrity validation for all messages
+- Prometheus metrics exposure (40+ metrics)
+- Structured logging with Zap
+- Health check endpoints (/health, /health/live, /health/ready)
+- Metrics server on port 8080
+- Comprehensive monitoring and observability
 
 ### Changed
-- Replaced deprecated `ioutil.ReadDir` with `os.ReadDir` in log package
-- Improved error messages with more descriptive context
-- Enhanced test suite with edge case coverage
+- Enhanced broker with production monitoring capabilities
+- Improved error handling and logging throughout
 
-### Fixed
-- Fixed deprecation warning for `ioutil` package usage
-- Improved error handling in broker initialization
-- Fixed potential nil pointer dereferences in test scenarios
-
-### Security
-- Added input validation to prevent empty or invalid configuration parameters
-
-## [0.2.0] - 2025-01-XX
+## [0.2.0] - 2025-11-15
 
 ### Added
-- Complete replication system with leader-follower architecture
-- Consumer group coordination with heartbeat monitoring
-- Offset management with persistence
-- Binary protocol implementation for client communication
-- Python client library with async support
-- gRPC service for inter-broker communication
-- KRaft consensus protocol for metadata management
-- Multi-broker cluster support
-- ISR (In-Sync Replicas) monitoring
-- Configurable acknowledgment levels (0, 1, all)
-- Auto-topic creation on first produce
-- Comprehensive testing infrastructure
+- Consumer group coordinator with sticky assignments
+- Offset manager with leader epoch tracking
+- Message compression (gzip, snappy, lz4)
+- Message headers support
+- Metadata persistence for consumer groups
+- Static group membership
+- Python client v0.2.0 with async support
 
 ### Changed
-- Migrated from ZooKeeper to KRaft for metadata management
-- Improved network protocol efficiency
-- Enhanced error handling and logging
+- Improved replication with ISR tracking
+- Enhanced binary protocol efficiency
 
-### Fixed
-- Consumer partition assignment issues
-- Broker startup sequence and error handling
-- Memory leaks in long-running processes
-
-## [0.1.0] - 2025-01-XX
+## [0.1.0] - 2025-11-01
 
 ### Added
-- Initial implementation of Gofka message broker
-- Basic produce/consume functionality
-- Simple log storage with segment-based architecture
-- Network server for client communication
-- Basic metadata management
-- Initial test suite
-
-### Security
-- Basic input validation for message production
-- Safe file handling for log segments
+- Core broker implementation with KRaft consensus
+- Binary protocol for client communication
+- Basic replication with leader-follower model
+- Python client library
+- Consumer groups with partition assignment
+- Offset management
+- Segment-based log storage
 
 

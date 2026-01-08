@@ -11,13 +11,20 @@ import (
 	"sync"
 	"time"
 
-	gofkav1 "github.com/user/gofka/api/v1"
+	gofkav1 "github.com/prashanth8983/gofka/api/v1"
 	"google.golang.org/protobuf/proto"
 )
 
 // BinaryProtocolHandler handles binary protocol requests
 type BinaryProtocolHandler interface {
 	HandleRequest(reader io.Reader, writer io.Writer) error
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Broker interface for message handling
@@ -121,20 +128,40 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.wg.Done()
 	}()
 
+	// Handle connection without peeking - directly process messages
 	for {
-		// Peek at the first few bytes to detect protocol
-		peekBuf := make([]byte, 8)
-		if _, err := io.ReadFull(conn, peekBuf); err != nil {
+		// Read message length (4 bytes)
+		lenBuf := make([]byte, 4)
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
 			if err == io.EOF {
 				return // Connection closed
 			}
-			fmt.Printf("Failed to peek at message: %v\n", err)
+			// Ignore timeouts and continue
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
 			return
 		}
 
-		// For now, assume all connections are Gofka protocol
-		// TODO: Implement proper protocol detection based on message content
-		s.handleGofkaConnection(conn, peekBuf)
+		msgLen := binary.BigEndian.Uint32(lenBuf)
+
+		// Validate message length
+		if msgLen == 0 || msgLen > 100*1024*1024 { // Max 100MB
+			fmt.Printf("Invalid message length: %d\n", msgLen)
+			return
+		}
+
+		// Read the complete message
+		msgBuf := make([]byte, msgLen)
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if _, err := io.ReadFull(conn, msgBuf); err != nil {
+			fmt.Printf("Failed to read message: %v\n", err)
+			return
+		}
+
+		// Process the message
+		s.processGofkaMessage(conn, msgBuf)
 	}
 }
 
@@ -185,80 +212,14 @@ func (s *Server) handleKafkaConnection(conn net.Conn, peekBuf []byte) {
 	conn.Write([]byte(response))
 }
 
-// handleGofkaConnection handles Gofka protocol connections
-func (s *Server) handleGofkaConnection(conn net.Conn, peekBuf []byte) {
-	// Handle the first message using the peeked data
-	if len(peekBuf) >= 4 {
-		msgLen := binary.BigEndian.Uint32(peekBuf[:4])
-
-		// Validate message length
-		if msgLen == 0 || msgLen > 100*1024*1024 { // Max 100MB
-			fmt.Printf("Invalid message length in peeked data: %d\n", msgLen)
-			return
-		}
-
-		// We need to read the remaining bytes of the first message
-		totalBytesNeeded := int(msgLen) + 4 // +4 for the length header
-
-		var fullMessage []byte
-		if len(peekBuf) >= totalBytesNeeded {
-			// We already have the complete message in peekBuf
-			fullMessage = peekBuf[4:totalBytesNeeded]
-		} else {
-			// We need to read more bytes
-			remaining := totalBytesNeeded - len(peekBuf)
-			remainingBuf := make([]byte, remaining)
-			conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-			if _, err := io.ReadFull(conn, remainingBuf); err != nil {
-				fmt.Printf("Failed to read remaining message bytes: %v\n", err)
-				return
-			}
-
-			// Combine peeked data (excluding length) with remaining bytes
-			fullMessage = make([]byte, msgLen)
-			copy(fullMessage, peekBuf[4:])
-			copy(fullMessage[len(peekBuf)-4:], remainingBuf)
-		}
-
-		// Process the first message
-		s.processGofkaMessage(conn, fullMessage)
-	}
-
-	// Continue with normal message processing loop
-	for {
-		// Read the message length with timeout
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		lenBuf := make([]byte, 4)
-		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			if err == io.EOF {
-				return // Connection closed gracefully
-			}
-			fmt.Printf("Failed to read message length: %v\n", err)
-			return
-		}
-		msgLen := binary.BigEndian.Uint32(lenBuf)
-
-		// Validate message length
-		if msgLen == 0 || msgLen > 100*1024*1024 { // Max 100MB
-			fmt.Printf("Invalid message length: %d\n", msgLen)
-			return
-		}
-
-		// Read the message with timeout
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		msgBuf := make([]byte, msgLen)
-		if _, err := io.ReadFull(conn, msgBuf); err != nil {
-			fmt.Printf("Failed to read message: %v\n", err)
-			return
-		}
-
-		s.processGofkaMessage(conn, msgBuf)
-	}
-}
+// Removed handleGofkaConnection - no longer needed after simplification
 
 func (s *Server) processGofkaMessage(conn net.Conn, msgBuf []byte) {
+	fmt.Printf("Processing message of %d bytes, first bytes: %x\n", len(msgBuf), msgBuf[:min(10, len(msgBuf))])
+
 	// Try binary protocol first (for Python/Go clients)
 	if s.tryBinaryProtocol(conn, msgBuf) {
+		fmt.Println("Message handled by binary protocol")
 		return
 	}
 
@@ -307,12 +268,17 @@ func (s *Server) tryBinaryProtocol(conn net.Conn, msgBuf []byte) bool {
 	// Check if this looks like a binary protocol message
 	// Binary protocol starts with: api_key (2 bytes) + api_version (2 bytes)
 	if len(msgBuf) < 4 {
+		fmt.Printf("Message too short for binary protocol: %d bytes\n", len(msgBuf))
 		return false
 	}
 
-	// Check if API key is in valid range (0-16)
+	// Check if API key is in valid range (0-50 to be safe)
 	apiKey := binary.BigEndian.Uint16(msgBuf[0:2])
-	if apiKey > 16 {
+	apiVersion := binary.BigEndian.Uint16(msgBuf[2:4])
+	fmt.Printf("Detected API key: %d, API version: %d\n", apiKey, apiVersion)
+
+	if apiKey > 50 {
+		fmt.Printf("API key %d out of range, not binary protocol\n", apiKey)
 		return false // Not a valid API key, probably protobuf
 	}
 
@@ -332,6 +298,7 @@ func (s *Server) tryBinaryProtocol(conn net.Conn, msgBuf []byte) bool {
 	reader := bytes.NewReader(fullMsg)
 	writer := &bytes.Buffer{}
 
+	fmt.Printf("Calling binary protocol handler with %d bytes\n", len(fullMsg))
 	if err := handler.HandleRequest(reader, writer); err != nil {
 		fmt.Printf("Binary protocol handler error: %v\n", err)
 		conn.Close()
@@ -339,8 +306,11 @@ func (s *Server) tryBinaryProtocol(conn net.Conn, msgBuf []byte) bool {
 	}
 
 	// Write response back to connection
+	responseBytes := writer.Bytes()
+	fmt.Printf("Binary protocol handler returned %d bytes\n", len(responseBytes))
+
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if _, err := conn.Write(writer.Bytes()); err != nil {
+	if _, err := conn.Write(responseBytes); err != nil {
 		fmt.Printf("Failed to write binary protocol response: %v\n", err)
 	}
 
