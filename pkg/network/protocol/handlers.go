@@ -38,6 +38,8 @@ type ConsumerGroupInterface interface {
 type ConsumerMemberInterface interface {
 	GetMemberID() string
 	GetSubscriptions() []string
+	GetClientID() string
+	GetClientHost() string
 }
 
 // ConsumerGroupCoordinatorInterface defines consumer group operations
@@ -46,6 +48,17 @@ type ConsumerGroupCoordinatorInterface interface {
 	SyncGroup(groupID, memberID string, generation int32) (ConsumerGroupInterface, error)
 	Heartbeat(groupID, memberID string, generation int32) error
 	LeaveGroup(groupID, memberID string) error
+	// ListGroups returns all consumer group IDs
+	ListGroups() []string
+	// GetGroup returns a consumer group by ID
+	GetGroup(groupID string) (ConsumerGroupInterface, error)
+}
+
+// ConsumerGroupDetailInterface extends ConsumerGroupInterface with additional details
+type ConsumerGroupDetailInterface interface {
+	ConsumerGroupInterface
+	GetProtocol() string
+	GetState() string
 }
 
 // BrokerMetadata represents broker information
@@ -887,8 +900,92 @@ func (h *RequestHandler) handleOffsetFetch(reader io.Reader, writer io.Writer, h
 }
 
 func (h *RequestHandler) handleFindCoordinator(reader io.Reader, writer io.Writer, header *RequestHeader) error {
-	// TODO: Implement find coordinator handler
-	return fmt.Errorf("find coordinator handler not implemented yet")
+	// Read coordinator key (group ID or transactional ID)
+	var keyLen int16
+	if err := binary.Read(reader, binary.BigEndian, &keyLen); err != nil {
+		return fmt.Errorf("failed to read key length: %w", err)
+	}
+	keyBytes := make([]byte, keyLen)
+	if _, err := io.ReadFull(reader, keyBytes); err != nil {
+		return fmt.Errorf("failed to read key: %w", err)
+	}
+	// keyType: 0 = group coordinator, 1 = transaction coordinator
+	// For now, we only support group coordinators
+	_ = string(keyBytes) // group ID
+
+	// Get broker info - in Gofka, all brokers can be coordinators
+	brokers := h.broker.GetProtocolBrokers()
+
+	// Write response header
+	if err := binary.Write(writer, binary.BigEndian, header.CorrelationID); err != nil {
+		return fmt.Errorf("failed to write correlation ID: %w", err)
+	}
+
+	// Write throttle time (0 for now)
+	if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+		return fmt.Errorf("failed to write throttle time: %w", err)
+	}
+
+	// Write error code (0 = no error)
+	if err := binary.Write(writer, binary.BigEndian, int16(0)); err != nil {
+		return fmt.Errorf("failed to write error code: %w", err)
+	}
+
+	// Write error message (empty)
+	if err := binary.Write(writer, binary.BigEndian, int16(0)); err != nil {
+		return fmt.Errorf("failed to write error message length: %w", err)
+	}
+
+	// Use the first broker as coordinator (in production, this would be determined by hash)
+	if len(brokers) > 0 {
+		broker := brokers[0]
+
+		// Write node ID (convert string ID to int32)
+		// For simplicity, use 1 as default node ID
+		if err := binary.Write(writer, binary.BigEndian, int32(1)); err != nil {
+			return fmt.Errorf("failed to write node ID: %w", err)
+		}
+
+		// Extract host and port from broker address
+		host := "localhost"
+		port := int32(9092)
+		if broker.Addr != "" {
+			// Parse address (format: host:port)
+			for i := len(broker.Addr) - 1; i >= 0; i-- {
+				if broker.Addr[i] == ':' {
+					host = broker.Addr[:i]
+					fmt.Sscanf(broker.Addr[i+1:], "%d", &port)
+					break
+				}
+			}
+		}
+
+		// Write host
+		if err := binary.Write(writer, binary.BigEndian, int16(len(host))); err != nil {
+			return fmt.Errorf("failed to write host length: %w", err)
+		}
+		if _, err := writer.Write([]byte(host)); err != nil {
+			return fmt.Errorf("failed to write host: %w", err)
+		}
+
+		// Write port
+		if err := binary.Write(writer, binary.BigEndian, port); err != nil {
+			return fmt.Errorf("failed to write port: %w", err)
+		}
+	} else {
+		// No brokers available - write error
+		if err := binary.Write(writer, binary.BigEndian, int32(-1)); err != nil {
+			return fmt.Errorf("failed to write node ID: %w", err)
+		}
+		if err := binary.Write(writer, binary.BigEndian, int16(0)); err != nil {
+			return fmt.Errorf("failed to write host length: %w", err)
+		}
+		if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+			return fmt.Errorf("failed to write port: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (h *RequestHandler) handleJoinGroup(reader io.Reader, writer io.Writer, header *RequestHeader) error {
@@ -1167,11 +1264,210 @@ func (h *RequestHandler) handleSyncGroup(reader io.Reader, writer io.Writer, hea
 }
 
 func (h *RequestHandler) handleDescribeGroups(reader io.Reader, writer io.Writer, header *RequestHeader) error {
-	// TODO: Implement describe groups handler
-	return fmt.Errorf("describe groups handler not implemented yet")
+	// Read number of group IDs
+	var numGroups int32
+	if err := binary.Read(reader, binary.BigEndian, &numGroups); err != nil {
+		return fmt.Errorf("failed to read number of groups: %w", err)
+	}
+
+	// Read group IDs
+	groupIDs := make([]string, numGroups)
+	for i := int32(0); i < numGroups; i++ {
+		var groupIDLen int16
+		if err := binary.Read(reader, binary.BigEndian, &groupIDLen); err != nil {
+			return fmt.Errorf("failed to read group ID length: %w", err)
+		}
+		groupIDBytes := make([]byte, groupIDLen)
+		if _, err := io.ReadFull(reader, groupIDBytes); err != nil {
+			return fmt.Errorf("failed to read group ID: %w", err)
+		}
+		groupIDs[i] = string(groupIDBytes)
+	}
+
+	// Write response header
+	if err := binary.Write(writer, binary.BigEndian, header.CorrelationID); err != nil {
+		return fmt.Errorf("failed to write correlation ID: %w", err)
+	}
+
+	// Write throttle time (0 for now)
+	if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+		return fmt.Errorf("failed to write throttle time: %w", err)
+	}
+
+	// Write number of groups
+	if err := binary.Write(writer, binary.BigEndian, numGroups); err != nil {
+		return fmt.Errorf("failed to write number of groups: %w", err)
+	}
+
+	coordinator := h.broker.GetProtocolConsumerGroupCoordinator()
+
+	// Write group descriptions
+	for _, groupID := range groupIDs {
+		// Write error code
+		group, err := coordinator.GetGroup(groupID)
+		if err != nil {
+			// Group not found error code = 16
+			if err := binary.Write(writer, binary.BigEndian, int16(16)); err != nil {
+				return fmt.Errorf("failed to write error code: %w", err)
+			}
+			// Write group ID
+			if err := h.writeString(writer, groupID); err != nil {
+				return err
+			}
+			// Write empty state
+			if err := h.writeString(writer, ""); err != nil {
+				return err
+			}
+			// Write empty protocol type
+			if err := h.writeString(writer, ""); err != nil {
+				return err
+			}
+			// Write empty protocol
+			if err := h.writeString(writer, ""); err != nil {
+				return err
+			}
+			// Write 0 members
+			if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Group found - write success
+		if err := binary.Write(writer, binary.BigEndian, int16(0)); err != nil {
+			return fmt.Errorf("failed to write error code: %w", err)
+		}
+
+		// Write group ID
+		if err := h.writeString(writer, groupID); err != nil {
+			return err
+		}
+
+		// Write state (check if group implements ConsumerGroupDetailInterface)
+		state := "Stable"
+		protocol := "consumer"
+		if detailGroup, ok := group.(ConsumerGroupDetailInterface); ok {
+			state = detailGroup.GetState()
+			protocol = detailGroup.GetProtocol()
+		}
+		if err := h.writeString(writer, state); err != nil {
+			return err
+		}
+
+		// Write protocol type
+		if err := h.writeString(writer, "consumer"); err != nil {
+			return err
+		}
+
+		// Write protocol
+		if err := h.writeString(writer, protocol); err != nil {
+			return err
+		}
+
+		// Write members
+		members := group.GetMembers()
+		if err := binary.Write(writer, binary.BigEndian, int32(len(members))); err != nil {
+			return fmt.Errorf("failed to write member count: %w", err)
+		}
+
+		assignments := group.GetAssignments()
+		for memberID, member := range members {
+			// Write member ID
+			if err := h.writeString(writer, memberID); err != nil {
+				return err
+			}
+
+			// Write client ID
+			if err := h.writeString(writer, member.GetClientID()); err != nil {
+				return err
+			}
+
+			// Write client host
+			if err := h.writeString(writer, member.GetClientHost()); err != nil {
+				return err
+			}
+
+			// Write member metadata (subscriptions as bytes)
+			subscriptions := member.GetSubscriptions()
+			metadataLen := 4 // 4 bytes for subscription count
+			for _, sub := range subscriptions {
+				metadataLen += 2 + len(sub) // 2 bytes length + string
+			}
+			if err := binary.Write(writer, binary.BigEndian, int32(metadataLen)); err != nil {
+				return err
+			}
+			if err := binary.Write(writer, binary.BigEndian, int32(len(subscriptions))); err != nil {
+				return err
+			}
+			for _, sub := range subscriptions {
+				if err := binary.Write(writer, binary.BigEndian, int16(len(sub))); err != nil {
+					return err
+				}
+				if _, err := writer.Write([]byte(sub)); err != nil {
+					return err
+				}
+			}
+
+			// Write member assignment (partition assignments as bytes)
+			memberAssignment, ok := assignments[memberID]
+			if !ok {
+				memberAssignment = []int32{}
+			}
+			assignmentLen := 4 + len(memberAssignment)*4 // count + partitions
+			if err := binary.Write(writer, binary.BigEndian, int32(assignmentLen)); err != nil {
+				return err
+			}
+			if err := binary.Write(writer, binary.BigEndian, int32(len(memberAssignment))); err != nil {
+				return err
+			}
+			for _, partition := range memberAssignment {
+				if err := binary.Write(writer, binary.BigEndian, partition); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (h *RequestHandler) handleListGroups(reader io.Reader, writer io.Writer, header *RequestHeader) error {
-	// TODO: Implement list groups handler
-	return fmt.Errorf("list groups handler not implemented yet")
+	// Write response header
+	if err := binary.Write(writer, binary.BigEndian, header.CorrelationID); err != nil {
+		return fmt.Errorf("failed to write correlation ID: %w", err)
+	}
+
+	// Write throttle time (0 for now)
+	if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+		return fmt.Errorf("failed to write throttle time: %w", err)
+	}
+
+	// Write error code (0 = no error)
+	if err := binary.Write(writer, binary.BigEndian, int16(0)); err != nil {
+		return fmt.Errorf("failed to write error code: %w", err)
+	}
+
+	// Get list of groups from coordinator
+	coordinator := h.broker.GetProtocolConsumerGroupCoordinator()
+	groupIDs := coordinator.ListGroups()
+
+	// Write number of groups
+	if err := binary.Write(writer, binary.BigEndian, int32(len(groupIDs))); err != nil {
+		return fmt.Errorf("failed to write group count: %w", err)
+	}
+
+	// Write each group
+	for _, groupID := range groupIDs {
+		// Write group ID
+		if err := h.writeString(writer, groupID); err != nil {
+			return err
+		}
+
+		// Write protocol type (consumer for all groups)
+		if err := h.writeString(writer, "consumer"); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

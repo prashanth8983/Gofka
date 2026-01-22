@@ -640,8 +640,8 @@ func (c *ConsumerGroupCoordinator) checkRebalancingState() {
 	}
 }
 
-// GetGroup returns a consumer group by ID
-func (c *ConsumerGroupCoordinator) GetGroup(groupID string) (*ConsumerGroup, error) {
+// GetGroup returns a consumer group by ID (implements protocol.ConsumerGroupCoordinatorInterface)
+func (c *ConsumerGroupCoordinator) GetGroup(groupID string) (protocol.ConsumerGroupInterface, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -651,6 +651,31 @@ func (c *ConsumerGroupCoordinator) GetGroup(groupID string) (*ConsumerGroup, err
 	}
 
 	return group, nil
+}
+
+// GetGroupInternal returns a consumer group by ID (internal method returning concrete type)
+func (c *ConsumerGroupCoordinator) GetGroupInternal(groupID string) (*ConsumerGroup, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	group, exists := c.groups[groupID]
+	if !exists {
+		return nil, fmt.Errorf("group %s not found", groupID)
+	}
+
+	return group, nil
+}
+
+// ListGroups returns all consumer group IDs (implements protocol.ConsumerGroupCoordinatorInterface)
+func (c *ConsumerGroupCoordinator) ListGroups() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	groupIDs := make([]string, 0, len(c.groups))
+	for groupID := range c.groups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	return groupIDs
 }
 
 // GetMember returns a consumer member by ID
@@ -721,6 +746,20 @@ func (g *ConsumerGroup) GetAssignments() map[string][]int32 {
 	return result
 }
 
+// GetProtocol returns the group protocol (e.g., "range", "roundrobin", "sticky")
+func (g *ConsumerGroup) GetProtocol() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.Protocol
+}
+
+// GetState returns the group state (e.g., "stable", "preparing_rebalance", "completing_rebalance")
+func (g *ConsumerGroup) GetState() string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.State
+}
+
 // Protocol interface implementation for ConsumerMember
 
 // GetMemberID returns the member ID
@@ -747,6 +786,20 @@ func (m *ConsumerMember) GetStaticMemberID() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.StaticMemberID
+}
+
+// GetClientID returns the client ID
+func (m *ConsumerMember) GetClientID() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ClientID
+}
+
+// GetClientHost returns the client host
+func (m *ConsumerMember) GetClientHost() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.ClientHost
 }
 
 // GroupState represents the persistent state of a consumer group
