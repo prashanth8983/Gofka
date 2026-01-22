@@ -146,28 +146,56 @@ func (ms *MetadataStore) GetPartitions(topicName string) []*Partition {
 func (ms *MetadataStore) AddMessage(msg *Message) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if _, ok := ms.messages[msg.Topic]; !ok {
-		ms.messages[msg.Topic] = make(map[int64]*Message)
+
+	// Use partition-aware key for new messages
+	key := fmt.Sprintf("%s-%d", msg.Topic, msg.Partition)
+	if _, ok := ms.messages[key]; !ok {
+		ms.messages[key] = make(map[int64]*Message)
 	}
-	ms.messages[msg.Topic][msg.Offset] = msg
+	ms.messages[key][msg.Offset] = msg
 }
 
-// GetMessage retrieves a message from the metadata store.
+// GetMessage retrieves a message from the metadata store (defaults to partition 0).
 func (ms *MetadataStore) GetMessage(topic string, offset int64) (*Message, bool) {
+	return ms.GetMessageFromPartition(topic, 0, offset)
+}
+
+// GetMessageFromPartition retrieves a message from a specific partition.
+func (ms *MetadataStore) GetMessageFromPartition(topic string, partition int32, offset int64) (*Message, bool) {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
-	if messages, ok := ms.messages[topic]; ok {
+
+	// Try partition-aware key first
+	key := fmt.Sprintf("%s-%d", topic, partition)
+	if messages, ok := ms.messages[key]; ok {
 		msg, ok := messages[offset]
 		return msg, ok
 	}
+
+	// Fallback to legacy topic-only key for backwards compatibility (partition 0 only)
+	if partition == 0 {
+		if messages, ok := ms.messages[topic]; ok {
+			msg, ok := messages[offset]
+			return msg, ok
+		}
+	}
+
 	return nil, false
 }
 
-// GetNextOffset returns the next available offset for a topic.
+// GetNextOffset returns the next available offset for a topic (partition 0).
 func (ms *MetadataStore) GetNextOffset(topic string) int64 {
+	return ms.GetNextOffsetForPartition(topic, 0)
+}
+
+// GetNextOffsetForPartition returns the next available offset for a specific topic-partition.
+func (ms *MetadataStore) GetNextOffsetForPartition(topic string, partition int32) int64 {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
-	if messages, ok := ms.messages[topic]; ok {
+
+	// Use a composite key for topic-partition
+	key := fmt.Sprintf("%s-%d", topic, partition)
+	if messages, ok := ms.messages[key]; ok {
 		var maxOffset int64 = -1
 		for offset := range messages {
 			if offset > maxOffset {
@@ -176,6 +204,18 @@ func (ms *MetadataStore) GetNextOffset(topic string) int64 {
 		}
 		return maxOffset + 1
 	}
+
+	// Fallback to legacy topic-only key for backwards compatibility
+	if messages, ok := ms.messages[topic]; ok && partition == 0 {
+		var maxOffset int64 = -1
+		for offset := range messages {
+			if offset > maxOffset {
+				maxOffset = offset
+			}
+		}
+		return maxOffset + 1
+	}
+
 	return 0
 }
 

@@ -458,9 +458,20 @@ func (b *Broker) Stop() error {
 	return nil
 }
 
+// logKey generates a unique key for the logs map based on topic and partition
+func logKey(topic string, partition int32) string {
+	return fmt.Sprintf("%s-%d", topic, partition)
+}
+
 func (b *Broker) getOrCreateLog(topic string) (*log.Log, error) {
+	return b.getOrCreateLogForPartition(topic, 0)
+}
+
+func (b *Broker) getOrCreateLogForPartition(topic string, partition int32) (*log.Log, error) {
+	key := logKey(topic, partition)
+
 	b.mu.RLock()
-	existingLog, ok := b.logs[topic]
+	existingLog, ok := b.logs[key]
 	b.mu.RUnlock()
 
 	if ok {
@@ -471,37 +482,48 @@ func (b *Broker) getOrCreateLog(topic string) (*log.Log, error) {
 	defer b.mu.Unlock()
 
 	// Double check if the log was created while we were waiting for the lock
-	existingLog, ok = b.logs[topic]
+	existingLog, ok = b.logs[key]
 	if ok {
 		return existingLog, nil
 	}
 
-	logDir := filepath.Join(b.logDir, topic)
+	logDir := filepath.Join(b.logDir, topic, fmt.Sprintf("partition-%d", partition))
 	newLog, err := log.NewLog(logDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new log: %w", err)
 	}
 
-	b.logs[topic] = newLog
+	b.logs[key] = newLog
 	return newLog, nil
 }
 
 // ProduceMessage handles message production through Raft consensus.
 func (b *Broker) ProduceMessage(topic string, message []byte) (int64, error) {
-	offset, err := b.ProduceMessageWithAcks(topic, message, b.defaultAcks, b.defaultTimeoutMs)
+	return b.ProduceMessageToPartition(topic, 0, message)
+}
+
+// ProduceMessageToPartition handles message production to a specific partition
+func (b *Broker) ProduceMessageToPartition(topic string, partition int32, message []byte) (int64, error) {
+	offset, err := b.ProduceMessageWithAcksToPartition(topic, partition, message, b.defaultAcks, b.defaultTimeoutMs)
 	if err == nil {
-		logger.LogProducedMessage(topic, 0, offset, len(message))
-		metrics.RecordProducedMessage(topic, 0, len(message))
+		logger.LogProducedMessage(topic, partition, offset, len(message))
+		metrics.RecordProducedMessage(topic, partition, len(message))
 	}
 	return offset, err
 }
 
-// ProduceMessageWithAcks handles message production with ack configuration
+// ProduceMessageWithAcks handles message production with ack configuration (defaults to partition 0)
 func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, timeoutMs int32) (int64, error) {
+	return b.ProduceMessageWithAcksToPartition(topic, 0, message, acks, timeoutMs)
+}
+
+// ProduceMessageWithAcksToPartition handles message production to a specific partition with ack configuration
+func (b *Broker) ProduceMessageWithAcksToPartition(topic string, partitionID int32, message []byte, acks, timeoutMs int32) (int64, error) {
 	// Auto-create topic and partition metadata if they don't exist
-	if _, exists := b.metadataStore.GetTopic(topic); !exists {
+	topicMeta, exists := b.metadataStore.GetTopic(topic)
+	if !exists {
 		// Create topic with default settings
-		topicMeta := &metadata.Topic{
+		topicMeta = &metadata.Topic{
 			Name:              topic,
 			NumPartitions:     1,
 			ReplicationFactor: 1,
@@ -518,19 +540,36 @@ func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, time
 		b.metadataStore.AddPartition(partition)
 	}
 
-	// Check if this broker is the leader for partition 0
-	partition, _ := b.metadataStore.GetPartition(topic, 0)
-	if partition != nil && partition.Leader != b.nodeID {
-		return 0, fmt.Errorf("not leader for partition %s-0", topic)
+	// Validate partition exists
+	if partitionID >= topicMeta.NumPartitions {
+		return 0, fmt.Errorf("partition %d does not exist for topic %s (has %d partitions)", partitionID, topic, topicMeta.NumPartitions)
 	}
 
-	// Get the next offset for this topic from the replicated state
-	offset := b.metadataStore.GetNextOffset(topic)
+	// Check if partition metadata exists, create if needed
+	partition, _ := b.metadataStore.GetPartition(topic, partitionID)
+	if partition == nil {
+		// Create the partition metadata
+		partition = &metadata.Partition{
+			TopicName: topic,
+			ID:        partitionID,
+			Leader:    b.nodeID,
+			Replicas:  []string{b.nodeID},
+		}
+		b.metadataStore.AddPartition(partition)
+	}
+
+	// Check if this broker is the leader for this partition
+	if partition.Leader != b.nodeID {
+		return 0, fmt.Errorf("not leader for partition %s-%d", topic, partitionID)
+	}
+
+	// Get the next offset for this topic-partition from the replicated state
+	offset := b.metadataStore.GetNextOffsetForPartition(topic, partitionID)
 
 	// Create a message replication command
 	msg := &metadata.Message{
 		Topic:     topic,
-		Partition: 0, // For now, use partition 0
+		Partition: partitionID,
 		Offset:    offset,
 		Data:      message,
 	}
@@ -546,7 +585,7 @@ func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, time
 	}
 
 	// Also store locally for immediate availability (this will be consistent across all nodes)
-	log, err := b.getOrCreateLog(topic)
+	log, err := b.getOrCreateLogForPartition(topic, partitionID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get or create log: %w", err)
 	}
@@ -566,11 +605,10 @@ func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, time
 		return offset, nil
 	case -1:
 		// All ISR acks required - check ISR count
-		isr := b.replicationManager.GetISR(topic, 0)
+		isr := b.replicationManager.GetISR(topic, partitionID)
 		if int32(len(isr)) < b.minInsyncReplicas {
 			return 0, fmt.Errorf("not enough in-sync replicas: %d < %d", len(isr), b.minInsyncReplicas)
 		}
-		// TODO: Wait for all ISR to acknowledge
 		// For now, just return since we're using Raft which ensures replication
 		return offset, nil
 	default:
@@ -582,14 +620,14 @@ func (b *Broker) ProduceMessageWithAcks(topic string, message []byte, acks, time
 // ConsumeMessage handles message consumption from replicated state.
 func (b *Broker) ConsumeMessage(topic string, partition int32, offset int64) ([]byte, error) {
 	// First try to get message from replicated state (available on all brokers)
-	if msg, found := b.metadataStore.GetMessage(topic, offset); found {
+	if msg, found := b.metadataStore.GetMessageFromPartition(topic, partition, offset); found {
 		logger.LogConsumedMessage(topic, partition, offset, "")
 		metrics.RecordConsumedMessage(topic, partition, "", len(msg.Data))
 		return msg.Data, nil
 	}
 
 	// Fallback to local log for backwards compatibility
-	log, err := b.getOrCreateLog(topic)
+	log, err := b.getOrCreateLogForPartition(topic, partition)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get or create log: %w", err)
 	}
@@ -645,10 +683,14 @@ func (b *Broker) GetPartitions(topicName string) []network.PartitionMetadata {
 	return result
 }
 
-// CreateTopic creates a new topic in the cluster.
+// CreateTopic creates a new topic in the cluster with the specified number of partitions.
 func (b *Broker) CreateTopic(topicName string, numPartitions int32) error {
-	// For now, create topic locally for testing
-	// TODO: Use consensus protocol for distributed topic creation
+	// Validate partition count
+	if numPartitions < 1 {
+		numPartitions = 1
+	}
+
+	// Create topic metadata
 	topic := &metadata.Topic{
 		Name:              topicName,
 		NumPartitions:     numPartitions,
@@ -657,19 +699,21 @@ func (b *Broker) CreateTopic(topicName string, numPartitions int32) error {
 
 	b.metadataStore.AddTopic(topic)
 
-	// Create a default partition for the topic
-	partition := &metadata.Partition{
-		TopicName: topicName,
-		ID:        0,
-		Leader:    b.nodeID,
-		Replicas:  []string{b.nodeID},
-	}
-	b.metadataStore.AddPartition(partition)
+	// Create all partitions for the topic
+	for i := int32(0); i < numPartitions; i++ {
+		partition := &metadata.Partition{
+			TopicName: topicName,
+			ID:        i,
+			Leader:    b.nodeID,
+			Replicas:  []string{b.nodeID},
+		}
+		b.metadataStore.AddPartition(partition)
 
-	// Create the log for this topic to ensure the directory structure exists
-	_, err := b.getOrCreateLog(topicName)
-	if err != nil {
-		return fmt.Errorf("failed to create log for topic %s: %w", topicName, err)
+		// Create the log for this partition to ensure the directory structure exists
+		_, err := b.getOrCreateLogForPartition(topicName, i)
+		if err != nil {
+			return fmt.Errorf("failed to create log for topic %s partition %d: %w", topicName, i, err)
+		}
 	}
 
 	return nil
@@ -747,9 +791,15 @@ func (b *Broker) GetLog(topic string, partition int32) *log.Log {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// For now, use topic as key (single partition support)
-	// TODO: Support multiple partitions
-	return b.logs[topic]
+	key := logKey(topic, partition)
+	if log, ok := b.logs[key]; ok {
+		return log
+	}
+	// Fallback to legacy topic-only key for backwards compatibility
+	if partition == 0 {
+		return b.logs[topic]
+	}
+	return nil
 }
 
 // getLog is an internal helper method for getting a log without exposing the broker
@@ -757,9 +807,15 @@ func (b *Broker) getLog(topic string, partition int32) *log.Log {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	// For now, use topic as key (single partition support)
-	// TODO: Support multiple partitions
-	return b.logs[topic]
+	key := logKey(topic, partition)
+	if log, ok := b.logs[key]; ok {
+		return log
+	}
+	// Fallback to legacy topic-only key for backwards compatibility
+	if partition == 0 {
+		return b.logs[topic]
+	}
+	return nil
 }
 
 // Protocol adapter methods to avoid import cycles
