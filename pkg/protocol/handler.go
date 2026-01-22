@@ -282,25 +282,495 @@ func (h *RequestHandler) handleMetadata(reader io.Reader, response io.Writer, ap
 
 // handleProduce handles produce requests
 func (h *RequestHandler) handleProduce(reader io.Reader, writer io.Writer, apiVersion int16) error {
-	// For now, return a simple acknowledgment
-	// TODO: Implement full produce handling
-	binary.Write(writer, binary.BigEndian, int32(0)) // Number of responses
+	// Read required acks
+	var requiredAcks int16
+	if err := binary.Read(reader, binary.BigEndian, &requiredAcks); err != nil {
+		return fmt.Errorf("failed to read required acks: %w", err)
+	}
+
+	// Read timeout
+	var timeout int32
+	if err := binary.Read(reader, binary.BigEndian, &timeout); err != nil {
+		return fmt.Errorf("failed to read timeout: %w", err)
+	}
+
+	// Read number of topics
+	var numTopics int32
+	if err := binary.Read(reader, binary.BigEndian, &numTopics); err != nil {
+		return fmt.Errorf("failed to read number of topics: %w", err)
+	}
+
+	type topicResponse struct {
+		topic      string
+		partitions []struct {
+			partition int32
+			errorCode int16
+			offset    int64
+			timestamp int64
+		}
+	}
+	responses := make([]topicResponse, 0, numTopics)
+
+	// Process each topic
+	for i := int32(0); i < numTopics; i++ {
+		topicName := readString(reader)
+
+		// Read number of partitions
+		var numPartitions int32
+		if err := binary.Read(reader, binary.BigEndian, &numPartitions); err != nil {
+			return fmt.Errorf("failed to read number of partitions: %w", err)
+		}
+
+		resp := topicResponse{
+			topic:      topicName,
+			partitions: make([]struct {
+				partition int32
+				errorCode int16
+				offset    int64
+				timestamp int64
+			}, numPartitions),
+		}
+
+		for j := int32(0); j < numPartitions; j++ {
+			var partition int32
+			if err := binary.Read(reader, binary.BigEndian, &partition); err != nil {
+				return fmt.Errorf("failed to read partition: %w", err)
+			}
+
+			// Read message set size
+			var messageSetSize int32
+			if err := binary.Read(reader, binary.BigEndian, &messageSetSize); err != nil {
+				return fmt.Errorf("failed to read message set size: %w", err)
+			}
+
+			// Read message set
+			messageSet := make([]byte, messageSetSize)
+			if _, err := io.ReadFull(reader, messageSet); err != nil {
+				return fmt.Errorf("failed to read message set: %w", err)
+			}
+
+			// Produce the message
+			offset, err := h.broker.ProduceMessage(topicName, messageSet)
+			if err != nil {
+				resp.partitions[j] = struct {
+					partition int32
+					errorCode int16
+					offset    int64
+					timestamp int64
+				}{
+					partition: partition,
+					errorCode: 1, // Unknown error
+					offset:    -1,
+					timestamp: currentTimeMillis(),
+				}
+			} else {
+				resp.partitions[j] = struct {
+					partition int32
+					errorCode int16
+					offset    int64
+					timestamp int64
+				}{
+					partition: partition,
+					errorCode: 0,
+					offset:    offset,
+					timestamp: currentTimeMillis(),
+				}
+			}
+		}
+		responses = append(responses, resp)
+	}
+
+	// Write response
+	// Write number of topics
+	if err := binary.Write(writer, binary.BigEndian, int32(len(responses))); err != nil {
+		return fmt.Errorf("failed to write number of topics: %w", err)
+	}
+
+	for _, resp := range responses {
+		// Write topic name
+		writeString(writer, resp.topic)
+
+		// Write number of partitions
+		if err := binary.Write(writer, binary.BigEndian, int32(len(resp.partitions))); err != nil {
+			return fmt.Errorf("failed to write number of partitions: %w", err)
+		}
+
+		for _, partResp := range resp.partitions {
+			// Write partition
+			if err := binary.Write(writer, binary.BigEndian, partResp.partition); err != nil {
+				return fmt.Errorf("failed to write partition: %w", err)
+			}
+			// Write error code
+			if err := binary.Write(writer, binary.BigEndian, partResp.errorCode); err != nil {
+				return fmt.Errorf("failed to write error code: %w", err)
+			}
+			// Write offset
+			if err := binary.Write(writer, binary.BigEndian, partResp.offset); err != nil {
+				return fmt.Errorf("failed to write offset: %w", err)
+			}
+			// Write timestamp (for version >= 2)
+			if apiVersion >= 2 {
+				if err := binary.Write(writer, binary.BigEndian, partResp.timestamp); err != nil {
+					return fmt.Errorf("failed to write timestamp: %w", err)
+				}
+			}
+		}
+	}
+
+	// Write throttle time for version >= 1
+	if apiVersion >= 1 {
+		if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+			return fmt.Errorf("failed to write throttle time: %w", err)
+		}
+	}
+
 	return nil
 }
 
 // handleFetch handles fetch requests
 func (h *RequestHandler) handleFetch(reader io.Reader, writer io.Writer, apiVersion int16) error {
-	// For now, return empty messages
-	// TODO: Implement full fetch handling
-	binary.Write(writer, binary.BigEndian, int32(0)) // Number of responses
+	// Read replica ID (usually -1 for consumers)
+	var replicaID int32
+	if err := binary.Read(reader, binary.BigEndian, &replicaID); err != nil {
+		return fmt.Errorf("failed to read replica ID: %w", err)
+	}
+
+	// Read max wait time
+	var maxWaitMs int32
+	if err := binary.Read(reader, binary.BigEndian, &maxWaitMs); err != nil {
+		return fmt.Errorf("failed to read max wait time: %w", err)
+	}
+
+	// Read min bytes
+	var minBytes int32
+	if err := binary.Read(reader, binary.BigEndian, &minBytes); err != nil {
+		return fmt.Errorf("failed to read min bytes: %w", err)
+	}
+
+	// Read max bytes (for version >= 3)
+	if apiVersion >= 3 {
+		var maxBytes int32
+		if err := binary.Read(reader, binary.BigEndian, &maxBytes); err != nil {
+			return fmt.Errorf("failed to read max bytes: %w", err)
+		}
+	}
+
+	// Read isolation level (for version >= 4)
+	if apiVersion >= 4 {
+		var isolationLevel int8
+		if err := binary.Read(reader, binary.BigEndian, &isolationLevel); err != nil {
+			return fmt.Errorf("failed to read isolation level: %w", err)
+		}
+	}
+
+	// Read number of topics
+	var numTopics int32
+	if err := binary.Read(reader, binary.BigEndian, &numTopics); err != nil {
+		return fmt.Errorf("failed to read number of topics: %w", err)
+	}
+
+	type partitionResponse struct {
+		partition           int32
+		errorCode           int16
+		highWatermark       int64
+		lastStableOffset    int64
+		abortedTransactions []struct{}
+		records             []byte
+	}
+
+	type topicResponse struct {
+		topic      string
+		partitions []partitionResponse
+	}
+
+	responses := make([]topicResponse, 0, numTopics)
+
+	// Process each topic
+	for i := int32(0); i < numTopics; i++ {
+		topicName := readString(reader)
+
+		// Read number of partitions
+		var numPartitions int32
+		if err := binary.Read(reader, binary.BigEndian, &numPartitions); err != nil {
+			return fmt.Errorf("failed to read number of partitions: %w", err)
+		}
+
+		resp := topicResponse{
+			topic:      topicName,
+			partitions: make([]partitionResponse, numPartitions),
+		}
+
+		for j := int32(0); j < numPartitions; j++ {
+			var partition int32
+			if err := binary.Read(reader, binary.BigEndian, &partition); err != nil {
+				return fmt.Errorf("failed to read partition: %w", err)
+			}
+
+			var fetchOffset int64
+			if err := binary.Read(reader, binary.BigEndian, &fetchOffset); err != nil {
+				return fmt.Errorf("failed to read fetch offset: %w", err)
+			}
+
+			// Read log start offset (for version >= 5)
+			if apiVersion >= 5 {
+				var logStartOffset int64
+				if err := binary.Read(reader, binary.BigEndian, &logStartOffset); err != nil {
+					return fmt.Errorf("failed to read log start offset: %w", err)
+				}
+			}
+
+			var partitionMaxBytes int32
+			if err := binary.Read(reader, binary.BigEndian, &partitionMaxBytes); err != nil {
+				return fmt.Errorf("failed to read partition max bytes: %w", err)
+			}
+
+			// Fetch the message
+			message, err := h.broker.ConsumeMessage(topicName, partition, fetchOffset)
+			if err != nil {
+				resp.partitions[j] = partitionResponse{
+					partition:     partition,
+					errorCode:     1, // Offset out of range or other error
+					highWatermark: 0,
+					records:       nil,
+				}
+			} else {
+				resp.partitions[j] = partitionResponse{
+					partition:     partition,
+					errorCode:     0,
+					highWatermark: fetchOffset + 1, // Simple implementation
+					records:       message,
+				}
+			}
+		}
+		responses = append(responses, resp)
+	}
+
+	// Write throttle time (for version >= 1)
+	if apiVersion >= 1 {
+		if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+			return fmt.Errorf("failed to write throttle time: %w", err)
+		}
+	}
+
+	// Write number of topics
+	if err := binary.Write(writer, binary.BigEndian, int32(len(responses))); err != nil {
+		return fmt.Errorf("failed to write number of topics: %w", err)
+	}
+
+	for _, resp := range responses {
+		// Write topic name
+		writeString(writer, resp.topic)
+
+		// Write number of partitions
+		if err := binary.Write(writer, binary.BigEndian, int32(len(resp.partitions))); err != nil {
+			return fmt.Errorf("failed to write number of partitions: %w", err)
+		}
+
+		for _, partResp := range resp.partitions {
+			// Write partition
+			if err := binary.Write(writer, binary.BigEndian, partResp.partition); err != nil {
+				return fmt.Errorf("failed to write partition: %w", err)
+			}
+			// Write error code
+			if err := binary.Write(writer, binary.BigEndian, partResp.errorCode); err != nil {
+				return fmt.Errorf("failed to write error code: %w", err)
+			}
+			// Write high watermark
+			if err := binary.Write(writer, binary.BigEndian, partResp.highWatermark); err != nil {
+				return fmt.Errorf("failed to write high watermark: %w", err)
+			}
+
+			// Write last stable offset (for version >= 4)
+			if apiVersion >= 4 {
+				if err := binary.Write(writer, binary.BigEndian, partResp.lastStableOffset); err != nil {
+					return fmt.Errorf("failed to write last stable offset: %w", err)
+				}
+			}
+
+			// Write log start offset (for version >= 5)
+			if apiVersion >= 5 {
+				if err := binary.Write(writer, binary.BigEndian, int64(0)); err != nil {
+					return fmt.Errorf("failed to write log start offset: %w", err)
+				}
+			}
+
+			// Write aborted transactions (for version >= 4)
+			if apiVersion >= 4 {
+				if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+					return fmt.Errorf("failed to write aborted transactions count: %w", err)
+				}
+			}
+
+			// Write record set size and records
+			recordLen := int32(0)
+			if partResp.records != nil {
+				recordLen = int32(len(partResp.records))
+			}
+			if err := binary.Write(writer, binary.BigEndian, recordLen); err != nil {
+				return fmt.Errorf("failed to write record set size: %w", err)
+			}
+			if recordLen > 0 {
+				if _, err := writer.Write(partResp.records); err != nil {
+					return fmt.Errorf("failed to write records: %w", err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
 // handleListOffsets handles list offsets requests
 func (h *RequestHandler) handleListOffsets(reader io.Reader, writer io.Writer, apiVersion int16) error {
-	// For now, return default offsets
-	// TODO: Implement full list offsets handling
-	binary.Write(writer, binary.BigEndian, int32(0)) // Number of responses
+	// Read replica ID
+	var replicaID int32
+	if err := binary.Read(reader, binary.BigEndian, &replicaID); err != nil {
+		return fmt.Errorf("failed to read replica ID: %w", err)
+	}
+
+	// Read isolation level (for version >= 2)
+	if apiVersion >= 2 {
+		var isolationLevel int8
+		if err := binary.Read(reader, binary.BigEndian, &isolationLevel); err != nil {
+			return fmt.Errorf("failed to read isolation level: %w", err)
+		}
+	}
+
+	// Read number of topics
+	var numTopics int32
+	if err := binary.Read(reader, binary.BigEndian, &numTopics); err != nil {
+		return fmt.Errorf("failed to read number of topics: %w", err)
+	}
+
+	type partitionResponse struct {
+		partition int32
+		errorCode int16
+		timestamp int64
+		offset    int64
+	}
+
+	type topicResponse struct {
+		topic      string
+		partitions []partitionResponse
+	}
+
+	responses := make([]topicResponse, 0, numTopics)
+	offsetMgr := h.broker.GetProtocolOffsetManager()
+
+	// Process each topic
+	for i := int32(0); i < numTopics; i++ {
+		topicName := readString(reader)
+
+		// Read number of partitions
+		var numPartitions int32
+		if err := binary.Read(reader, binary.BigEndian, &numPartitions); err != nil {
+			return fmt.Errorf("failed to read number of partitions: %w", err)
+		}
+
+		resp := topicResponse{
+			topic:      topicName,
+			partitions: make([]partitionResponse, numPartitions),
+		}
+
+		for j := int32(0); j < numPartitions; j++ {
+			var partition int32
+			if err := binary.Read(reader, binary.BigEndian, &partition); err != nil {
+				return fmt.Errorf("failed to read partition: %w", err)
+			}
+
+			// Read timestamp (-1 = latest, -2 = earliest)
+			var timestamp int64
+			if err := binary.Read(reader, binary.BigEndian, &timestamp); err != nil {
+				return fmt.Errorf("failed to read timestamp: %w", err)
+			}
+
+			// Get the appropriate offset based on timestamp
+			var offset int64
+			var err error
+
+			if timestamp == -1 {
+				// Latest offset
+				offset, err = offsetMgr.GetLatestOffset(topicName, partition)
+			} else if timestamp == -2 {
+				// Earliest offset
+				offset, err = offsetMgr.GetEarliestOffset(topicName, partition)
+			} else {
+				// For specific timestamp, return latest for now (would need time-based index)
+				offset, err = offsetMgr.GetLatestOffset(topicName, partition)
+			}
+
+			if err != nil {
+				resp.partitions[j] = partitionResponse{
+					partition: partition,
+					errorCode: 3, // Unknown topic or partition
+					timestamp: -1,
+					offset:    -1,
+				}
+			} else {
+				resp.partitions[j] = partitionResponse{
+					partition: partition,
+					errorCode: 0,
+					timestamp: timestamp,
+					offset:    offset,
+				}
+			}
+		}
+		responses = append(responses, resp)
+	}
+
+	// Write throttle time (for version >= 2)
+	if apiVersion >= 2 {
+		if err := binary.Write(writer, binary.BigEndian, int32(0)); err != nil {
+			return fmt.Errorf("failed to write throttle time: %w", err)
+		}
+	}
+
+	// Write number of topics
+	if err := binary.Write(writer, binary.BigEndian, int32(len(responses))); err != nil {
+		return fmt.Errorf("failed to write number of topics: %w", err)
+	}
+
+	for _, resp := range responses {
+		// Write topic name
+		writeString(writer, resp.topic)
+
+		// Write number of partitions
+		if err := binary.Write(writer, binary.BigEndian, int32(len(resp.partitions))); err != nil {
+			return fmt.Errorf("failed to write number of partitions: %w", err)
+		}
+
+		for _, partResp := range resp.partitions {
+			// Write partition
+			if err := binary.Write(writer, binary.BigEndian, partResp.partition); err != nil {
+				return fmt.Errorf("failed to write partition: %w", err)
+			}
+			// Write error code
+			if err := binary.Write(writer, binary.BigEndian, partResp.errorCode); err != nil {
+				return fmt.Errorf("failed to write error code: %w", err)
+			}
+
+			// Version 0 returns multiple timestamps/offsets, version >= 1 returns single
+			if apiVersion >= 1 {
+				// Write timestamp
+				if err := binary.Write(writer, binary.BigEndian, partResp.timestamp); err != nil {
+					return fmt.Errorf("failed to write timestamp: %w", err)
+				}
+				// Write offset
+				if err := binary.Write(writer, binary.BigEndian, partResp.offset); err != nil {
+					return fmt.Errorf("failed to write offset: %w", err)
+				}
+			} else {
+				// Version 0: write array of offsets
+				if err := binary.Write(writer, binary.BigEndian, int32(1)); err != nil {
+					return fmt.Errorf("failed to write offset count: %w", err)
+				}
+				if err := binary.Write(writer, binary.BigEndian, partResp.offset); err != nil {
+					return fmt.Errorf("failed to write offset: %w", err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
