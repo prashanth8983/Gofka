@@ -159,12 +159,12 @@ func (b *Broker) Start(bootstrap bool, peers []string) error {
 	b.running = true
 	b.mu.Unlock()
 
-	fmt.Printf("Starting broker with node ID: %s, bootstrap: %v, peers: %v\n", b.nodeID, bootstrap, peers)
+	logger.Info("Starting broker", zap.String("node_id", b.nodeID), zap.Bool("bootstrap", bootstrap), zap.Strings("peers", peers))
 
 	// If bootstrapping, cleanup existing Raft state first
 	if bootstrap {
 		if err := b.cleanupRaftState(); err != nil {
-			fmt.Printf("Warning: failed to cleanup Raft state: %v\n", err)
+			logger.Warn("Failed to cleanup Raft state", zap.Error(err))
 		}
 	}
 
@@ -194,11 +194,11 @@ func (b *Broker) Start(bootstrap bool, peers []string) error {
 
 	// Start consensus in the background - it shouldn't block broker operation
 	go func() {
-		fmt.Println("Starting consensus in background...")
+		logger.Debug("Starting consensus in background")
 		if err := b.consensus.Start(bootstrap, peers); err != nil {
-			fmt.Printf("Warning: consensus failed to start: %v (broker will continue in standalone mode)\n", err)
+			logger.Warn("Consensus failed to start, broker will continue in standalone mode", zap.Error(err))
 		} else {
-			fmt.Println("Consensus started successfully")
+			logger.Info("Consensus started successfully")
 		}
 	}()
 
@@ -229,7 +229,6 @@ func (b *Broker) Start(bootstrap bool, peers []string) error {
 	// Update metrics
 	metrics.BrokerUp.WithLabelValues(b.nodeID).Set(1)
 
-	fmt.Printf("Broker started successfully on %s\n", b.addr)
 	return nil
 }
 
@@ -261,9 +260,9 @@ func (b *Broker) startGRPCServer() error {
 	gofkav1.RegisterGofkaServiceServer(b.grpcServer, &grpcBrokerWrapper{broker: b})
 
 	go func() {
-		fmt.Printf("gRPC server listening on %s\n", grpcAddr)
+		logger.Info("gRPC server listening", zap.String("addr", grpcAddr))
 		if err := b.grpcServer.Serve(lis); err != nil {
-			fmt.Printf("gRPC server error: %v\n", err)
+			logger.Error("gRPC server error", zap.Error(err))
 		}
 	}()
 
@@ -272,7 +271,7 @@ func (b *Broker) startGRPCServer() error {
 
 // attemptJoinCluster tries to join an existing cluster
 func (b *Broker) attemptJoinCluster(peers []string) {
-	fmt.Printf("Attempting to join cluster via peers: %v\n", peers)
+	logger.Info("Attempting to join cluster", zap.Strings("peers", peers))
 
 	// Wait a bit for the network server to be fully ready
 	time.Sleep(2 * time.Second)
@@ -286,18 +285,18 @@ func (b *Broker) attemptJoinCluster(peers []string) {
 		// Convert Raft address to broker address (port - 10000)
 		brokerAddr := convertRaftAddrToBrokerAddr(peerRaftAddr)
 		if brokerAddr == "" {
-			fmt.Printf("Could not convert Raft address: %s\n", peerRaftAddr)
+			logger.Warn("Could not convert Raft address", zap.String("raft_addr", peerRaftAddr))
 			continue
 		}
 
-		fmt.Printf("Sending join request to broker at %s\n", brokerAddr)
+		logger.Debug("Sending join request", zap.String("broker_addr", brokerAddr))
 
 		// Use the broker client to send join request
 		client := NewBrokerClient()
 		defer client.Close()
 
 		if err := client.Connect(brokerAddr); err != nil {
-			fmt.Printf("Failed to connect to broker %s: %v\n", brokerAddr, err)
+			logger.Warn("Failed to connect to broker", zap.String("addr", brokerAddr), zap.Error(err))
 			continue
 		}
 
@@ -313,27 +312,27 @@ func (b *Broker) attemptJoinCluster(peers []string) {
 		})
 
 		if err != nil {
-			fmt.Printf("Join cluster RPC failed for %s: %v\n", brokerAddr, err)
+			logger.Warn("Join cluster RPC failed", zap.String("addr", brokerAddr), zap.Error(err))
 			continue
 		}
 
 		if resp.Success {
-			fmt.Printf("Successfully joined cluster via %s\n", brokerAddr)
+			logger.Info("Successfully joined cluster", zap.String("via", brokerAddr))
 			return
 		}
 
 		// If not the leader, try the leader address
 		if !resp.IsLeader && resp.LeaderAddress != "" {
-			fmt.Printf("Peer %s is not leader, redirecting to leader at %s\n", brokerAddr, resp.LeaderAddress)
+			logger.Debug("Peer is not leader, redirecting", zap.String("peer", brokerAddr), zap.String("leader", resp.LeaderAddress))
 
 			// Convert leader's Raft address to gRPC address
 			leaderGrpcAddr := convertRaftAddrToBrokerAddr(resp.LeaderAddress)
 			if leaderGrpcAddr == "" {
-				fmt.Printf("Could not convert leader Raft address: %s\n", resp.LeaderAddress)
+				logger.Warn("Could not convert leader Raft address", zap.String("leader_addr", resp.LeaderAddress))
 				continue
 			}
 
-			fmt.Printf("Retrying join request to leader at %s\n", leaderGrpcAddr)
+			logger.Debug("Retrying join request to leader", zap.String("leader_addr", leaderGrpcAddr))
 
 			// Create new client for leader
 			leaderClient := NewBrokerClient()
@@ -341,7 +340,7 @@ func (b *Broker) attemptJoinCluster(peers []string) {
 
 			leaderConn, err := grpc.Dial(leaderGrpcAddr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(10*time.Second))
 			if err != nil {
-				fmt.Printf("Failed to connect to leader %s: %v\n", leaderGrpcAddr, err)
+				logger.Warn("Failed to connect to leader", zap.String("addr", leaderGrpcAddr), zap.Error(err))
 				continue
 			}
 			defer leaderConn.Close()
@@ -357,23 +356,23 @@ func (b *Broker) attemptJoinCluster(peers []string) {
 			})
 
 			if err != nil {
-				fmt.Printf("Failed to send join request to leader: %v\n", err)
+				logger.Warn("Failed to send join request to leader", zap.Error(err))
 				continue
 			}
 
 			if leaderResp.Success {
-				fmt.Printf("Successfully joined cluster via leader at %s\n", leaderGrpcAddr)
+				logger.Info("Successfully joined cluster via leader", zap.String("leader_addr", leaderGrpcAddr))
 				return
 			}
 
-			fmt.Printf("Leader join failed: %s\n", leaderResp.Error)
+			logger.Warn("Leader join failed", zap.String("error", leaderResp.Error))
 			continue
 		}
 
-		fmt.Printf("Join failed at %s: %s\n", brokerAddr, resp.Error)
+		logger.Warn("Join failed", zap.String("addr", brokerAddr), zap.String("error", resp.Error))
 	}
 
-	fmt.Println("Warning: Could not join cluster through any peer")
+	logger.Warn("Could not join cluster through any peer")
 }
 
 // convertRaftAddrToBrokerAddr converts Raft address to gRPC broker address
@@ -740,7 +739,7 @@ func (b *Broker) CreatePartition(topicName string, partitionID int32, leader str
 
 // cleanupRaftState removes existing Raft state for clean bootstrap
 func (b *Broker) cleanupRaftState() error {
-	fmt.Println("Cleaning up existing broker Raft state...")
+	logger.Debug("Cleaning up existing broker Raft state")
 
 	// Remove existing database files
 	dbFiles := []string{
@@ -750,22 +749,22 @@ func (b *Broker) cleanupRaftState() error {
 
 	for _, dbFile := range dbFiles {
 		if err := os.Remove(dbFile); err != nil && !os.IsNotExist(err) {
-			fmt.Printf("Warning: could not remove %s: %v\n", dbFile, err)
+			logger.Warn("Could not remove Raft DB file", zap.String("file", dbFile), zap.Error(err))
 		} else if err == nil {
-			fmt.Printf("Removed existing database file: %s\n", dbFile)
+			logger.Debug("Removed Raft DB file", zap.String("file", dbFile))
 		}
 	}
 
 	// Clean existing snapshots but keep the directory
 	snapshotDir := filepath.Join(b.raftDir, "snapshots")
 	if err := os.RemoveAll(snapshotDir); err != nil && !os.IsNotExist(err) {
-		fmt.Printf("Warning: could not remove snapshots directory: %v\n", err)
+		logger.Warn("Could not remove snapshots directory", zap.Error(err))
 	} else if err == nil {
-		fmt.Printf("Removed existing snapshots directory contents\n")
+		logger.Debug("Removed snapshots directory contents")
 	}
 	// Recreate the snapshots directory
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
-		fmt.Printf("Warning: could not recreate snapshots directory: %v\n", err)
+		logger.Warn("Could not recreate snapshots directory", zap.Error(err))
 	}
 
 	return nil
@@ -870,8 +869,6 @@ type protocolHandlerWrapper struct {
 }
 
 func (w *protocolHandlerWrapper) HandleRequest(reader io.Reader, writer io.Writer) error {
-	fmt.Println("protocolHandlerWrapper.HandleRequest called")
-
 	// Read all the data from the reader (the network server already consumed the size)
 	// The reader contains: size(4) + actual message
 	var size int32
@@ -888,7 +885,7 @@ func (w *protocolHandlerWrapper) HandleRequest(reader io.Reader, writer io.Write
 	wrapper := protocol.NewRequestHandlerWrapper(w.broker)
 	response, err := wrapper.HandleRequestWithoutSize(msgBuf)
 	if err != nil {
-		fmt.Printf("Handler error: %v\n", err)
+		logger.Error("Protocol handler error", zap.Error(err))
 		return err
 	}
 
@@ -991,13 +988,13 @@ func (b *Broker) startMetricsServer() error {
 	mux.HandleFunc("/health/live", health.LivenessHandler())
 	mux.HandleFunc("/health/ready", b.healthService.ReadinessHandler())
 
-	// Default metrics port (can be configured)
+	// Metrics port = broker port + 2000 (gRPC uses +1000)
 	metricsPort := 8080
 	if b.addr != "" && strings.Contains(b.addr, ":") {
 		parts := strings.Split(b.addr, ":")
 		if len(parts) == 2 {
 			if port, err := strconv.Atoi(parts[1]); err == nil {
-				metricsPort = port + 1000 // Use broker port + 1000 for metrics
+				metricsPort = port + 2000
 			}
 		}
 	}
