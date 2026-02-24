@@ -5,6 +5,10 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/prashanth8983/gofka/pkg/logger"
 )
 
 // ReplicaManager manages partition replication across brokers
@@ -308,7 +312,7 @@ func (rm *ReplicaManager) sendFollowerHeartbeat(replica *Replica) {
 	)
 
 	if err != nil {
-		fmt.Printf("Failed to send heartbeat to leader %s: %v\n", leaderAddr, err)
+		logger.Warn("Failed to send heartbeat to leader", zap.String("leader", leaderAddr), zap.Error(err))
 		return
 	}
 
@@ -459,14 +463,19 @@ func (rm *ReplicaManager) fetchFromLeader(replica *Replica, followerState *Follo
 	)
 
 	if err != nil {
-		fmt.Printf("Failed to fetch from leader %s for %s-%d: %v\n",
-			leaderAddr, replica.TopicName, replica.PartitionID, err)
+		logger.Warn("Failed to fetch from leader",
+			zap.String("leader", leaderAddr),
+			zap.String("topic", replica.TopicName),
+			zap.Int32("partition", replica.PartitionID),
+			zap.Error(err))
 		return
 	}
 
 	if resp.Error != "" {
-		fmt.Printf("Leader returned error for %s-%d: %s\n",
-			replica.TopicName, replica.PartitionID, resp.Error)
+		logger.Warn("Leader returned error",
+			zap.String("topic", replica.TopicName),
+			zap.Int32("partition", replica.PartitionID),
+			zap.String("error", resp.Error))
 		return
 	}
 
@@ -474,15 +483,19 @@ func (rm *ReplicaManager) fetchFromLeader(replica *Replica, followerState *Follo
 	if len(resp.Records) > 0 {
 		log := rm.broker.GetLog(replica.TopicName, replica.PartitionID)
 		if log == nil {
-			fmt.Printf("Log not found for %s-%d\n", replica.TopicName, replica.PartitionID)
+			logger.Debug("Log not found",
+				zap.String("topic", replica.TopicName),
+				zap.Int32("partition", replica.PartitionID))
 			return
 		}
 
 		for _, record := range resp.Records {
 			_, err := log.Append(record.Value)
 			if err != nil {
-				fmt.Printf("Failed to append record to log %s-%d: %v\n",
-					replica.TopicName, replica.PartitionID, err)
+				logger.Error("Failed to append record to log",
+					zap.String("topic", replica.TopicName),
+					zap.Int32("partition", replica.PartitionID),
+					zap.Error(err))
 				return
 			}
 		}

@@ -12,8 +12,18 @@ import (
 	"time"
 
 	gofkav1 "github.com/prashanth8983/gofka/api/v1"
+	"github.com/prashanth8983/gofka/pkg/logger"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
+
+// apiKeyName maps API key numbers to human-readable names
+var apiKeyName = map[uint16]string{
+	0: "Produce", 1: "Fetch", 3: "Metadata",
+	8: "OffsetCommit", 9: "OffsetFetch", 10: "FindCoordinator",
+	11: "JoinGroup", 12: "Heartbeat", 13: "LeaveGroup",
+	14: "SyncGroup", 15: "DescribeGroups", 16: "ListGroups",
+}
 
 // BinaryProtocolHandler handles binary protocol requests
 type BinaryProtocolHandler interface {
@@ -148,7 +158,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 		// Validate message length
 		if msgLen == 0 || msgLen > 100*1024*1024 { // Max 100MB
-			fmt.Printf("Invalid message length: %d\n", msgLen)
+			logger.Warn("Invalid message length", zap.Uint32("length", msgLen))
 			return
 		}
 
@@ -156,7 +166,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		msgBuf := make([]byte, msgLen)
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		if _, err := io.ReadFull(conn, msgBuf); err != nil {
-			fmt.Printf("Failed to read message: %v\n", err)
+			logger.Debug("Failed to read message", zap.Error(err))
 			return
 		}
 
@@ -175,7 +185,7 @@ func (s *Server) isKafkaProtocol(peekBuf []byte) bool {
 
 // handleKafkaConnection handles Kafka protocol connections
 func (s *Server) handleKafkaConnection(conn net.Conn, peekBuf []byte) {
-	fmt.Printf("Handling Kafka protocol connection from %s\n", conn.RemoteAddr())
+	logger.Debug("Handling Kafka protocol connection", zap.String("remote", conn.RemoteAddr().String()))
 
 	// Create a buffer that includes the peeked bytes
 	buf := make([]byte, 0, 1024)
@@ -189,7 +199,7 @@ func (s *Server) handleKafkaConnection(conn net.Conn, peekBuf []byte) {
 			if err == io.EOF {
 				break
 			}
-			fmt.Printf("Error reading Kafka request: %v\n", err)
+			logger.Debug("Error reading Kafka request", zap.Error(err))
 			return
 		}
 		buf = append(buf, tempBuf[:n]...)
@@ -205,7 +215,7 @@ func (s *Server) handleKafkaConnection(conn net.Conn, peekBuf []byte) {
 
 	// For now, just acknowledge that we received a Kafka protocol message
 	// TODO: Implement full Kafka protocol handling
-	fmt.Printf("Received Kafka protocol message of size %d bytes\n", len(buf))
+	logger.Debug("Received Kafka protocol message", zap.Int("size", len(buf)))
 
 	// Send a simple acknowledgment
 	response := fmt.Sprintf("Kafka protocol message received (%d bytes)\n", len(buf))
@@ -215,18 +225,15 @@ func (s *Server) handleKafkaConnection(conn net.Conn, peekBuf []byte) {
 // Removed handleGofkaConnection - no longer needed after simplification
 
 func (s *Server) processGofkaMessage(conn net.Conn, msgBuf []byte) {
-	fmt.Printf("Processing message of %d bytes, first bytes: %x\n", len(msgBuf), msgBuf[:min(10, len(msgBuf))])
-
 	// Try binary protocol first (for Python/Go clients)
 	if s.tryBinaryProtocol(conn, msgBuf) {
-		fmt.Println("Message handled by binary protocol")
 		return
 	}
 
 	// Fall back to protobuf protocol
 	req := &gofkav1.Request{}
 	if err := proto.Unmarshal(msgBuf, req); err != nil {
-		fmt.Printf("Failed to unmarshal request: %v\n", err)
+		logger.Warn("Failed to unmarshal protobuf request", zap.Error(err))
 		s.sendErrorResponse(conn, "Invalid request format")
 		return
 	}
@@ -234,7 +241,7 @@ func (s *Server) processGofkaMessage(conn net.Conn, msgBuf []byte) {
 	// Handle the request
 	resp, err := s.handleRequest(req)
 	if err != nil {
-		fmt.Printf("Failed to handle request: %v\n", err)
+		logger.Error("Failed to handle request", zap.Error(err))
 		s.sendErrorResponse(conn, fmt.Sprintf("Request handling error: %v", err))
 		return
 	}
@@ -242,7 +249,7 @@ func (s *Server) processGofkaMessage(conn net.Conn, msgBuf []byte) {
 	// Marshal the response
 	respBuf, err := proto.Marshal(resp)
 	if err != nil {
-		fmt.Printf("Failed to marshal response: %v\n", err)
+		logger.Error("Failed to marshal response", zap.Error(err))
 		s.sendErrorResponse(conn, "Response serialization error")
 		return
 	}
@@ -252,13 +259,13 @@ func (s *Server) processGofkaMessage(conn net.Conn, msgBuf []byte) {
 
 	// Write the response length
 	if err := binary.Write(conn, binary.BigEndian, uint32(len(respBuf))); err != nil {
-		fmt.Printf("Failed to write response length: %v\n", err)
+		logger.Debug("Failed to write response length", zap.Error(err))
 		return
 	}
 
 	// Write the response
 	if _, err := conn.Write(respBuf); err != nil {
-		fmt.Printf("Failed to write response: %v\n", err)
+		logger.Debug("Failed to write response", zap.Error(err))
 		return
 	}
 }
@@ -268,26 +275,26 @@ func (s *Server) tryBinaryProtocol(conn net.Conn, msgBuf []byte) bool {
 	// Check if this looks like a binary protocol message
 	// Binary protocol starts with: api_key (2 bytes) + api_version (2 bytes)
 	if len(msgBuf) < 4 {
-		fmt.Printf("Message too short for binary protocol: %d bytes\n", len(msgBuf))
 		return false
 	}
 
 	// Check if API key is in valid range (0-50 to be safe)
 	apiKey := binary.BigEndian.Uint16(msgBuf[0:2])
-	apiVersion := binary.BigEndian.Uint16(msgBuf[2:4])
-	fmt.Printf("Detected API key: %d, API version: %d\n", apiKey, apiVersion)
-
 	if apiKey > 50 {
-		fmt.Printf("API key %d out of range, not binary protocol\n", apiKey)
 		return false // Not a valid API key, probably protobuf
 	}
 
 	// Get binary protocol handler from broker
 	handler := s.broker.GetBinaryProtocolHandler()
 	if handler == nil {
-		fmt.Printf("Broker does not support binary protocol\n")
 		return false
 	}
+
+	name := apiKeyName[apiKey]
+	if name == "" {
+		name = fmt.Sprintf("Unknown(%d)", apiKey)
+	}
+	logger.Debug("Request", zap.String("api", name), zap.Int("size", len(msgBuf)))
 
 	// The protocol handler expects to read the size first, but we already consumed it.
 	// Prepend the size to msgBuf so the handler can read it.
@@ -298,29 +305,25 @@ func (s *Server) tryBinaryProtocol(conn net.Conn, msgBuf []byte) bool {
 	reader := bytes.NewReader(fullMsg)
 	writer := &bytes.Buffer{}
 
-	fmt.Printf("Calling binary protocol handler with %d bytes\n", len(fullMsg))
 	if err := handler.HandleRequest(reader, writer); err != nil {
-		fmt.Printf("Binary protocol handler error: %v\n", err)
+		logger.Error("Binary protocol handler error", zap.String("api", name), zap.Error(err))
 		conn.Close()
 		return true
 	}
 
 	// Write response back to connection
 	responseBytes := writer.Bytes()
-	fmt.Printf("Binary protocol handler returned %d bytes\n", len(responseBytes))
 
 	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	if _, err := conn.Write(responseBytes); err != nil {
-		fmt.Printf("Failed to write binary protocol response: %v\n", err)
+		logger.Warn("Failed to write response", zap.String("api", name), zap.Error(err))
 	}
 
 	return true
 }
 
 func (s *Server) sendErrorResponse(conn net.Conn, message string) {
-	// For now, just log the error and close the connection gracefully
-	// TODO: Implement proper error response once protobuf definitions are available
-	fmt.Printf("Sending error response: %s\n", message)
+	logger.Warn("Sending error response", zap.String("message", message))
 	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 	conn.Close()
 }

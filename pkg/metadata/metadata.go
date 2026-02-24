@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/prashanth8983/gofka/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // Broker represents the metadata for a Gofka broker.
@@ -230,7 +233,7 @@ type Command struct {
 func (c *Command) ToBytes() []byte {
 	data, err := json.Marshal(c)
 	if err != nil {
-		fmt.Printf("ERROR: failed to marshal command: %v\n", err)
+		logger.Error("Failed to marshal command", zap.Error(err))
 		return nil
 	}
 	return data

@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"go.uber.org/zap"
+
 	gofkav1 "github.com/prashanth8983/gofka/api/v1"
+	"github.com/prashanth8983/gofka/pkg/logger"
 )
 
 // grpcBrokerWrapper wraps the broker to implement gRPC service interface
@@ -119,8 +122,10 @@ func (w *grpcBrokerWrapper) ReplicaHeartbeat(ctx context.Context, req *gofkav1.R
 
 // JoinCluster handles cluster join requests from new nodes
 func (w *grpcBrokerWrapper) JoinCluster(ctx context.Context, req *gofkav1.JoinClusterRequest) (*gofkav1.JoinClusterResponse, error) {
-	fmt.Printf("Received join cluster request from node %s (raft: %s, broker: %s)\n",
-		req.NodeId, req.RaftAddress, req.BrokerAddress)
+	logger.Info("Received join cluster request",
+		zap.String("node_id", req.NodeId),
+		zap.String("raft_addr", req.RaftAddress),
+		zap.String("broker_addr", req.BrokerAddress))
 
 	// Check if we're the leader
 	isLeader := w.broker.consensus.IsLeader()
@@ -151,7 +156,7 @@ func (w *grpcBrokerWrapper) JoinCluster(ctx context.Context, req *gofkav1.JoinCl
 		}, nil
 	}
 
-	fmt.Printf("Successfully added node %s to cluster\n", req.NodeId)
+	logger.Info("Successfully added node to cluster", zap.String("node_id", req.NodeId))
 
 	return &gofkav1.JoinClusterResponse{
 		Success:       true,

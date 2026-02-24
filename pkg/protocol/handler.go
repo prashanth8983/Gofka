@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/prashanth8983/gofka/pkg/logger"
+	"go.uber.org/zap"
 )
 
 func min(a, b int) int {
@@ -44,15 +47,11 @@ func NewRequestHandler(broker BrokerInterface) *RequestHandler {
 
 // HandleRequest processes a binary protocol request
 func (h *RequestHandler) HandleRequest(reader io.Reader, writer io.Writer) error {
-	fmt.Println("RequestHandler.HandleRequest starting")
-
 	// Read the message size (already consumed by server)
 	var messageSize int32
 	if err := binary.Read(reader, binary.BigEndian, &messageSize); err != nil {
-		fmt.Printf("Failed to read message size: %v\n", err)
 		return fmt.Errorf("failed to read message size: %w", err)
 	}
-	fmt.Printf("Read message size: %d\n", messageSize)
 
 	// Read API key
 	var apiKey int16
@@ -86,8 +85,7 @@ func (h *RequestHandler) HandleRequest(reader io.Reader, writer io.Writer) error
 		}
 	}
 
-	fmt.Printf("Handling request: API=%d, Version=%d, Correlation=%d, ClientID=%s\n",
-		apiKey, apiVersion, correlationID, string(clientID))
+	start := time.Now()
 
 	// Handle the request based on API key
 	var response bytes.Buffer
@@ -97,67 +95,41 @@ func (h *RequestHandler) HandleRequest(reader io.Reader, writer io.Writer) error
 		return fmt.Errorf("failed to write correlation ID: %w", err)
 	}
 
+	var handlerErr error
 	switch apiKey {
 	case APIKeyMetadata:
-		if err := h.handleMetadata(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling metadata: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleMetadata(reader, &response, apiVersion)
 	case APIKeyProduce:
-		if err := h.handleProduce(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling produce: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleProduce(reader, &response, apiVersion)
 	case APIKeyFetch:
-		if err := h.handleFetch(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling fetch: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleFetch(reader, &response, apiVersion)
 	case APIKeyListOffsets:
-		if err := h.handleListOffsets(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling list offsets: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleListOffsets(reader, &response, apiVersion)
 	case APIKeyCreateTopics:
-		if err := h.handleCreateTopics(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling create topics: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleCreateTopics(reader, &response, apiVersion)
 	case APIKeyOffsetCommit:
-		if err := h.handleOffsetCommit(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling offset commit: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleOffsetCommit(reader, &response, apiVersion)
 	case APIKeyOffsetFetch:
-		if err := h.handleOffsetFetch(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling offset fetch: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleOffsetFetch(reader, &response, apiVersion)
 	case APIKeyJoinGroup:
-		if err := h.handleJoinGroup(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling join group: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleJoinGroup(reader, &response, apiVersion)
 	case APIKeyHeartbeat:
-		if err := h.handleHeartbeat(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling heartbeat: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleHeartbeat(reader, &response, apiVersion)
 	case APIKeyLeaveGroup:
-		if err := h.handleLeaveGroup(reader, &response, apiVersion); err != nil {
-			fmt.Printf("Error handling leave group: %v\n", err)
-			return err
-		}
+		handlerErr = h.handleLeaveGroup(reader, &response, apiVersion)
 	default:
-		fmt.Printf("Unsupported API key: %d\n", apiKey)
-		// Write error response
-		binary.Write(&response, binary.BigEndian, int16(-1)) // Error code
+		logger.Warn("Unsupported API key", zap.Int16("api_key", apiKey))
+		binary.Write(&response, binary.BigEndian, int16(-1))
 		writeString(&response, fmt.Sprintf("Unsupported API key: %d", apiKey))
+	}
+
+	if handlerErr != nil {
+		logger.Error("Request handler error", zap.Int16("api_key", apiKey), zap.Error(handlerErr))
+		return handlerErr
 	}
 
 	// Write the complete response with size prefix
 	responseBytes := response.Bytes()
-	fmt.Printf("Response content: %d bytes, first bytes: %x\n", len(responseBytes), responseBytes[:min(20, len(responseBytes))])
 
 	if err := binary.Write(writer, binary.BigEndian, int32(len(responseBytes))); err != nil {
 		return fmt.Errorf("failed to write response size: %w", err)
@@ -167,7 +139,12 @@ func (h *RequestHandler) HandleRequest(reader io.Reader, writer io.Writer) error
 		return fmt.Errorf("failed to write response: %w", err)
 	}
 
-	fmt.Printf("Wrote response with size prefix: total %d bytes (4 size + %d content)\n", 4+len(responseBytes), len(responseBytes))
+	logger.Debug("Request handled",
+		zap.Int16("api_key", apiKey),
+		zap.Int32("correlation_id", correlationID),
+		zap.Duration("duration", time.Since(start)),
+		zap.Int("response_size", len(responseBytes)),
+	)
 	return nil
 }
 
@@ -276,7 +253,7 @@ func (h *RequestHandler) handleMetadata(reader io.Reader, response io.Writer, ap
 		}
 	}
 
-	fmt.Printf("Sent metadata response with %d brokers and %d topics\n", len(brokers), len(topics))
+	logger.Debug("Metadata response sent", zap.Int("brokers", len(brokers)), zap.Int("topics", len(topics)))
 	return nil
 }
 

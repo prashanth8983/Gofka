@@ -7,6 +7,10 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/prashanth8983/gofka/pkg/logger"
 )
 
 // OffsetManager manages consumer offsets for topics and partitions
@@ -402,7 +406,7 @@ func (c *OffsetManager) periodicCommit() {
 		case <-ticker.C:
 			if err := c.commitAllOffsets(); err != nil {
 				// Log error but continue
-				fmt.Printf("Failed to commit offsets: %v\n", err)
+				logger.Warn("Failed to commit offsets", zap.Error(err))
 			}
 		}
 	}
@@ -464,7 +468,7 @@ func (c *OffsetManager) periodicCompaction() {
 
 	for range ticker.C {
 		if err := c.compactOffsets(); err != nil {
-			fmt.Printf("Failed to compact offsets: %v\n", err)
+			logger.Warn("Failed to compact offsets", zap.Error(err))
 		}
 	}
 }
@@ -512,7 +516,7 @@ func (c *OffsetManager) compactOffsets() error {
 
 	c.lastCompaction = now
 	if expiredCount > 0 {
-		fmt.Printf("Compacted %d expired offsets\n", expiredCount)
+		logger.Debug("Compacted expired offsets", zap.Int("count", expiredCount))
 	}
 
 	return nil

@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
+	"github.com/prashanth8983/gofka/pkg/logger"
 	"github.com/prashanth8983/gofka/pkg/network/protocol"
 )
 
@@ -112,7 +115,7 @@ func (c *ConsumerGroupCoordinator) Start() error {
 	// Load existing state from disk
 	if err := c.loadState(); err != nil {
 		// Log error but don't fail - state will be rebuilt from scratch
-		fmt.Printf("Failed to load consumer group state: %v\n", err)
+		logger.Warn("Failed to load consumer group state", zap.Error(err))
 	}
 
 	// Start heartbeat monitoring
@@ -133,7 +136,7 @@ func (c *ConsumerGroupCoordinator) Stop() error {
 
 	// Persist state one final time before stopping
 	if err := c.persistState(); err != nil {
-		fmt.Printf("Failed to persist consumer group state on shutdown: %v\n", err)
+		logger.Warn("Failed to persist consumer group state on shutdown", zap.Error(err))
 	}
 
 	return nil
@@ -922,7 +925,7 @@ func (c *ConsumerGroupCoordinator) loadState() error {
 	assignmentsFile := filepath.Join(c.stateDir, "previous_assignments.json")
 	if data, err := os.ReadFile(assignmentsFile); err == nil {
 		if err := json.Unmarshal(data, &c.previousAssignments); err != nil {
-			fmt.Printf("Failed to unmarshal previous assignments: %v\n", err)
+			logger.Debug("Failed to unmarshal previous assignments", zap.Error(err))
 		}
 	}
 
@@ -939,13 +942,13 @@ func (c *ConsumerGroupCoordinator) loadState() error {
 		groupFile := filepath.Join(c.stateDir, entry.Name())
 		data, err := os.ReadFile(groupFile)
 		if err != nil {
-			fmt.Printf("Failed to read group file %s: %v\n", groupFile, err)
+			logger.Warn("Failed to read group file", zap.String("file", groupFile), zap.Error(err))
 			continue
 		}
 
 		var state GroupState
 		if err := json.Unmarshal(data, &state); err != nil {
-			fmt.Printf("Failed to unmarshal group file %s: %v\n", groupFile, err)
+			logger.Warn("Failed to unmarshal group file", zap.String("file", groupFile), zap.Error(err))
 			continue
 		}
 
@@ -977,7 +980,7 @@ func (c *ConsumerGroupCoordinator) loadState() error {
 		}
 	}
 
-	fmt.Printf("Loaded %d consumer groups from disk\n", len(c.groups))
+	logger.Info("Loaded consumer groups from disk", zap.Int("count", len(c.groups)))
 	return nil
 }
 
@@ -992,7 +995,7 @@ func (c *ConsumerGroupCoordinator) periodicPersist() {
 			return
 		case <-ticker.C:
 			if err := c.persistState(); err != nil {
-				fmt.Printf("Failed to persist consumer group state: %v\n", err)
+				logger.Warn("Failed to persist consumer group state", zap.Error(err))
 			}
 		}
 	}
